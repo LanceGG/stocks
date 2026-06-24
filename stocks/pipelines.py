@@ -1,3 +1,5 @@
+"""Scrapy Pipeline：将 Item 写入 MySQL。"""
+
 import pymysql
 from itemadapter import ItemAdapter
 from pymysql.err import OperationalError
@@ -7,6 +9,8 @@ from stocks.utils import UPSERT_HOLDING_SQL, get_mysql_settings
 
 
 class MySQLPipeline:
+    """基金排行 Pipeline：同时 upsert fund 与 fund_ranking 表。"""
+
     UPSERT_FUND_SQL = """
         INSERT INTO fund (
             fund_code, fund_name, pinyin_abbr, establish_date
@@ -120,6 +124,8 @@ class MySQLPipeline:
 
 
 class FundHoldingPipeline:
+    """基金持仓 Pipeline：逐条 upsert（fund_holding 爬虫已改用 FundBatchWriter 批量写入）。"""
+
     UPSERT_HOLDING_SQL = UPSERT_HOLDING_SQL
 
     def __init__(self, mysql_settings):

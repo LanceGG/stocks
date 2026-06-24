@@ -1,3 +1,5 @@
+"""东方财富基金排行爬虫：抓取 fund / fund_ranking 表数据。"""
+
 import json
 import re
 from urllib.parse import urlencode
@@ -6,6 +8,7 @@ import scrapy
 
 from stocks.items import FundRankingItem
 
+# 东方财富基金排行 API
 API_URL = "https://fund.eastmoney.com/data/rankhandler.aspx"
 
 
@@ -14,6 +17,7 @@ class FundSpider(scrapy.Spider):
     allowed_domains = ["fund.eastmoney.com"]
 
     custom_settings = {
+        # 模拟浏览器，避免被反爬
         "DEFAULT_REQUEST_HEADERS": {
             "Referer": "https://fund.eastmoney.com/data/fundranking.html",
             "User-Agent": (
@@ -25,6 +29,7 @@ class FundSpider(scrapy.Spider):
     }
 
     async def start(self):
+        """从第 1 页开始分页抓取。"""
         params = self._build_params(page_index=1)
         yield scrapy.Request(
             url=f"{API_URL}?{urlencode(params)}",
@@ -33,6 +38,7 @@ class FundSpider(scrapy.Spider):
         )
 
     def _build_params(self, page_index: int) -> dict:
+        """根据 settings 构建排行 API 查询参数。"""
         return {
             "op": self.settings.get("FUND_RANK_OP", "ph"),
             "dt": self.settings.get("FUND_RANK_DT", "kf"),
@@ -52,6 +58,7 @@ class FundSpider(scrapy.Spider):
         }
 
     def parse(self, response):
+        """解析单页排行数据，yield Item 并翻页。"""
         page_index = response.meta["page_index"]
         payload = self._extract_payload(response.text)
         if payload is None:
@@ -63,6 +70,7 @@ class FundSpider(scrapy.Spider):
         query_end_date = self.settings.get("FUND_RANK_ED", "2026-03-31")
         sort_column = self.settings.get("FUND_RANK_SC", "sqjzf")
 
+        # 每条记录为逗号分隔字符串，按固定字段顺序解析
         for record in records:
             fields = record.split(",")
             if len(fields) < 19:
@@ -111,6 +119,7 @@ class FundSpider(scrapy.Spider):
             payload.get("allRecords"),
         )
 
+        # 翻页：未达上限则请求下一页
         if page_index < target_pages:
             next_page = page_index + 1
             params = self._build_params(page_index=next_page)
@@ -122,6 +131,7 @@ class FundSpider(scrapy.Spider):
 
     @staticmethod
     def _extract_payload(text: str):
+        """从 JS 变量 rankData 中提取 JSON 数据。"""
         text = text.strip()
         if "var rankData" not in text:
             return None
@@ -147,11 +157,13 @@ class FundSpider(scrapy.Spider):
 
     @staticmethod
     def _empty_to_none(value):
+        """空字符串转为 None。"""
         value = (value or "").strip()
         return value or None
 
     @staticmethod
     def _to_decimal(value):
+        """字符串转浮点数，无效值返回 None。"""
         value = (value or "").strip()
         if not value or value == "--":
             return None
@@ -162,6 +174,7 @@ class FundSpider(scrapy.Spider):
 
     @staticmethod
     def _to_int(value):
+        """字符串转整数，无效值返回 None。"""
         value = (value or "").strip()
         if not value:
             return None

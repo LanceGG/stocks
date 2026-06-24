@@ -1,3 +1,5 @@
+"""公共工具：MySQL 读写、持仓解析、批量写入与无持仓基金过滤。"""
+
 import json
 import re
 from datetime import date
@@ -7,6 +9,7 @@ import pymysql
 
 
 def get_mysql_settings(crawler_settings) -> dict:
+    """从 Scrapy settings 构建 pymysql 连接参数字典。"""
     password = crawler_settings.get("MYSQL_PASSWORD")
     if password is None:
         password = ""
@@ -21,7 +24,10 @@ def get_mysql_settings(crawler_settings) -> dict:
 
 
 def load_synced_fund_codes(mysql_settings) -> set[str]:
-    """已有持仓数据的 fund_code 集合。"""
+    """加载 fund_holding 表中已有任意持仓数据的 fund_code 集合。
+
+    用于 fund_holding 爬虫启动时按基金维度跳过已爬取过的基金。
+    """
     connection = pymysql.connect(**mysql_settings)
     try:
         with connection.cursor() as cursor:
@@ -34,7 +40,10 @@ def load_synced_fund_codes(mysql_settings) -> set[str]:
 def load_synced_current_quarter_funds(
     mysql_settings, report_date: str
 ) -> set[str]:
-    """指定报告期已有持仓数据的 fund_code 集合。"""
+    """加载指定报告期已有持仓数据的 fund_code 集合。
+
+    用于 fund_holding_current 爬虫按当前季度跳过已同步基金。
+    """
     connection = pymysql.connect(**mysql_settings)
     try:
         with connection.cursor() as cursor:
@@ -51,6 +60,7 @@ def load_synced_current_quarter_funds(
         connection.close()
 
 
+# 持仓 upsert SQL，Pipeline 与 bulk_save 共用
 UPSERT_HOLDING_SQL = """
     INSERT INTO fund_holding (
         fund_code, report_date, report_year, report_quarter,
@@ -74,7 +84,16 @@ UPSERT_HOLDING_SQL = """
 
 
 def bulk_save_fund_holdings(mysql_settings, rows: list[dict[str, Any]], batch_size: int = 500) -> int:
-    """批量写入持仓数据。"""
+    """批量 upsert 持仓记录到 fund_holding 表。
+
+    Args:
+        mysql_settings: pymysql 连接参数
+        rows: 持仓字典列表
+        batch_size: executemany 每批条数
+
+    Returns:
+        写入总条数
+    """
     if not rows:
         return 0
 
@@ -90,23 +109,32 @@ def bulk_save_fund_holdings(mysql_settings, rows: list[dict[str, Any]], batch_si
 
 
 class FundBatchWriter:
-    """按基金跟踪请求进度，单只基金爬取完成后批量写入。"""
+    """按基金跟踪请求进度，单只基金全部请求完成后批量写入数据库。
+
+    工作流程：
+    1. register_request：发起请求前计数 +1
+    2. add_holdings：解析到持仓后缓存到内存
+    3. finish_request：请求完成计数 -1，归零时 flush 该基金的缓存
+    """
 
     def __init__(self, mysql_settings, logger, on_fund_complete=None):
         self._mysql_settings = mysql_settings
         self._logger = logger
-        self._on_fund_complete = on_fund_complete
-        self._active_requests: dict[str, int] = {}
-        self._pending_holdings: dict[str, list[dict[str, Any]]] = {}
+        self._on_fund_complete = on_fund_complete  # 单基金完成回调（如写入 fund_filter）
+        self._active_requests: dict[str, int] = {}  # fund_code -> 未完成请求数
+        self._pending_holdings: dict[str, list[dict[str, Any]]] = {}  # 待写入缓存
 
     def register_request(self, fund_code: str) -> None:
+        """注册一次新请求，活跃计数 +1。"""
         self._active_requests[fund_code] = self._active_requests.get(fund_code, 0) + 1
 
     def add_holdings(self, fund_code: str, rows: list[dict[str, Any]]) -> None:
+        """将解析到的持仓追加到该基金的待写入缓存。"""
         if rows:
             self._pending_holdings.setdefault(fund_code, []).extend(rows)
 
     def finish_request(self, fund_code: str) -> None:
+        """标记一次请求完成；该基金所有请求完成后触发 flush。"""
         count = self._active_requests.get(fund_code, 0)
         if count <= 1:
             self._active_requests.pop(fund_code, None)
@@ -115,12 +143,14 @@ class FundBatchWriter:
             self._active_requests[fund_code] = count - 1
 
     def flush_all(self) -> None:
+        """爬虫结束时兜底：刷写所有未完成基金的数据。"""
         for fund_code in list(self._pending_holdings):
             self._flush_fund(fund_code)
         for fund_code in list(self._active_requests):
             self._flush_fund(fund_code)
 
     def _flush_fund(self, fund_code: str) -> None:
+        """将单只基金的缓存批量写入数据库，并触发完成回调。"""
         rows = self._pending_holdings.pop(fund_code, [])
         wrote_holdings = bool(rows)
         if rows:
@@ -131,6 +161,7 @@ class FundBatchWriter:
 
 
 def load_funds_with_establish_date(mysql_settings) -> list[tuple[str, date | None]]:
+    """从 fund 表加载全部基金代码及成立日期，按代码排序。"""
     connection = pymysql.connect(**mysql_settings)
     try:
         with connection.cursor() as cursor:
@@ -143,7 +174,10 @@ def load_funds_with_establish_date(mysql_settings) -> list[tuple[str, date | Non
 
 
 def expected_latest_report_date(today: date | None = None) -> str:
-    """根据当前日期推算最新已结束季度的报告截止日。"""
+    """根据当前日期推算最新已结束季度的报告截止日。
+
+    例如 2026-06-18 -> 2025-12-31（Q4 已结束，Q1 尚未结束）。
+    """
     today = today or date.today()
     quarter_ends = [(3, 31), (6, 30), (9, 30), (12, 31)]
     for month, day in reversed(quarter_ends):
@@ -158,7 +192,11 @@ def filter_discovery_tasks(
     synced_fund_codes: set[str],
     skip_synced: bool,
 ) -> list[tuple[str, str]]:
-    """过滤出尚未爬取持仓的 (fund_code, holding_type) 任务（按基金维度跳过）。"""
+    """过滤出尚未爬取持仓的 (fund_code, holding_type) 任务。
+
+    按基金维度跳过：只要 fund_holding 有该基金的任意记录即跳过整只基金。
+    每只待爬基金生成 stock + bond 两个发现任务。
+    """
     tasks: list[tuple[str, str]] = []
     for fund_code, _ in funds:
         if skip_synced and fund_code in synced_fund_codes:
@@ -173,7 +211,10 @@ def filter_current_holding_tasks(
     synced_fund_codes: set[str],
     skip_synced: bool,
 ) -> list[tuple[str, str]]:
-    """过滤出当前报告期尚未入库的 (fund_code, holding_type) 任务（按基金维度跳过）。"""
+    """过滤出当前报告期尚未入库的 (fund_code, holding_type) 任务。
+
+    逻辑同 filter_discovery_tasks，但 synced 集合按当前 report_date 筛选。
+    """
     tasks: list[tuple[str, str]] = []
     for fund_code, _ in funds:
         if skip_synced and fund_code in synced_fund_codes:
@@ -184,7 +225,7 @@ def filter_current_holding_tasks(
 
 
 def load_filtered_fund_codes(mysql_settings) -> set[str]:
-    """加载 fund_filter 表中需跳过的基金代码。"""
+    """加载 fund_filter 表中需跳过的无持仓基金代码。"""
     connection = pymysql.connect(**mysql_settings)
     try:
         with connection.cursor() as cursor:
@@ -198,14 +239,14 @@ def exclude_filtered_funds(
     funds: list[tuple[str, date | None]],
     filtered_codes: set[str],
 ) -> list[tuple[str, date | None]]:
-    """排除 fund_filter 表中的基金。"""
+    """从基金列表中排除 fund_filter 表中的代码。"""
     if not filtered_codes:
         return funds
     return [(code, establish_date) for code, establish_date in funds if code not in filtered_codes]
 
 
 def save_fund_to_filter(mysql_settings, fund_code: str) -> bool:
-    """将无持仓基金从 fund 表复制写入 fund_filter。"""
+    """将确认无持仓的基金从 fund 表复制写入 fund_filter 表。"""
     connection = pymysql.connect(**mysql_settings)
     try:
         with connection.cursor() as cursor:
@@ -233,54 +274,64 @@ def save_fund_to_filter(mysql_settings, fund_code: str) -> bool:
 
 
 class FundFilterTracker:
-    """跟踪本次爬取中确认无持仓的基金，并写入 fund_filter。
+    """跟踪本次爬取中确认无持仓的基金，并在全部请求完成后写入 fund_filter。
 
-    仅在单只基金全部请求完成后判定是否无持仓，避免并发爬取时提前误判。
+    设计要点：
+    - 仅在单只基金全部请求完成后判定，避免并发时债券先返回空导致误判
+    - record_empty_type 只记录状态，不立即写库
+    - 需 stock/bond 两种类型均确认无持仓才写入 fund_filter
     """
 
     def __init__(self, mysql_settings, logger):
         self._mysql_settings = mysql_settings
         self._logger = logger
-        self._has_existing_holdings = lambda fund_code: False
+        self._has_existing_holdings = lambda fund_code: False  # 历史已有持仓检查
         self.filtered_codes = load_filtered_fund_codes(mysql_settings)
-        self._pending_checks: dict[str, set[str]] = {}
-        self._empty_types: dict[str, set[str]] = {}
-        self._types_with_years: set[tuple[str, str]] = set()
-        self._type_has_holdings: set[tuple[str, str]] = set()
+        self._pending_checks: dict[str, set[str]] = {}  # fund -> 待检查的类型集合
+        self._empty_types: dict[str, set[str]] = {}  # API 返回无历史年份的类型
+        self._types_with_years: set[tuple[str, str]] = set()  # 有年份数据的类型
+        self._type_has_holdings: set[tuple[str, str]] = set()  # 解析到持仓的类型
 
     def set_has_existing_holdings(self, fn) -> None:
+        """设置历史持仓检查函数（启动时加载的 synced 集合）。"""
         self._has_existing_holdings = fn
 
     def register_task(self, fund_code: str, holding_type: str) -> None:
+        """注册本次爬取任务（stock 或 bond）。"""
         self._pending_checks.setdefault(fund_code, set()).add(holding_type)
 
     def record_empty_type(self, fund_code: str, holding_type: str) -> None:
-        """接口返回无历史年份，仅记录状态，不立即写入 fund_filter。"""
+        """API 返回无历史年份，仅记录状态，不立即写入 fund_filter。"""
         self._empty_types.setdefault(fund_code, set()).add(holding_type)
 
     def record_types_with_years(self, fund_code: str, holding_type: str) -> None:
+        """记录该类型有可用历史年份（后续可能解析到空持仓）。"""
         self._types_with_years.add((fund_code, holding_type))
 
     def record_has_holdings(self, fund_code: str, holding_type: str) -> None:
+        """记录该类型确实解析到了持仓数据。"""
         self._type_has_holdings.add((fund_code, holding_type))
 
     def flush(self) -> None:
+        """爬虫结束时兜底检查所有待处理基金。"""
         for fund_code in self._pending_checks:
             self._try_save(fund_code)
 
     def try_save_fund(self, fund_code: str, *, wrote_holdings: bool = False) -> None:
+        """单只基金爬取完成时调用；若写入了持仓则跳过 fund_filter。"""
         if wrote_holdings:
             return
         self._try_save(fund_code)
 
     def _fund_has_crawled_holdings(self, fund_code: str) -> bool:
+        """本次爬取中是否任一类型解析到了持仓。"""
         return any(
             (fund_code, holding_type) in self._type_has_holdings
             for holding_type in ("stock", "bond")
         )
 
     def _confirmed_empty_types(self, fund_code: str) -> set[str]:
-        """仅在基金全部请求完成后调用，此时可确认有年份但未解析到持仓的类型。"""
+        """汇总已确认无持仓的类型（API 无年份 + 有年份但解析为空）。"""
         empty = set(self._empty_types.get(fund_code, set()))
         pending = self._pending_checks.get(fund_code, set())
         for holding_type in pending:
@@ -289,11 +340,13 @@ class FundFilterTracker:
                 continue
             if holding_type in empty:
                 continue
+            # 有年份但所有请求完成后仍未解析到持仓，视为该类型无持仓
             if key in self._types_with_years:
                 empty.add(holding_type)
         return empty
 
     def _try_save(self, fund_code: str) -> None:
+        """满足全部条件时将基金写入 fund_filter。"""
         if fund_code in self.filtered_codes:
             return
         if self._has_existing_holdings(fund_code):
@@ -305,6 +358,7 @@ class FundFilterTracker:
         if not pending:
             return
 
+        # 所有待检查类型均已确认无持仓
         if not pending.issubset(self._confirmed_empty_types(fund_code)):
             return
 
@@ -314,6 +368,10 @@ class FundFilterTracker:
 
 
 def parse_f10_apidata(text: str) -> dict[str, Any]:
+    """解析东方财富 F10 接口返回的 JS 变量 apidata。
+
+    返回 content（HTML 片段）、arryear（可用年份列表）、curyear（当前年）。
+    """
     text = text.strip()
     match = re.search(r'content:"(.*)",arryear:(\[[^\]]+\])', text, re.S)
     if not match:
@@ -329,7 +387,9 @@ def parse_f10_apidata(text: str) -> dict[str, Any]:
 
 
 def parse_stock_holdings(content: str, fund_code: str) -> list[dict[str, Any]]:
+    """从 HTML 内容中解析股票持仓，按季度分段提取。"""
     holdings: list[dict[str, Any]] = []
+    # 按 "2024年1季度..." 标题拆分各季度区块
     sections = re.split(r"(\d{4}年\d季度[^<]*)", content)
 
     for index in range(1, len(sections), 2):
@@ -351,6 +411,7 @@ def parse_stock_holdings(content: str, fund_code: str) -> list[dict[str, Any]]:
         )
 
         for rank, stock_code, stock_name, rest in rows:
+            # 提取占净值比例、持股数、市值三列
             nums = [
                 value.replace(",", "").replace("%", "").strip()
                 for value in re.findall(r"<td class='tor'>([^<]+)</td>", rest)
@@ -380,6 +441,7 @@ def parse_stock_holdings(content: str, fund_code: str) -> list[dict[str, Any]]:
 
 
 def parse_bond_holdings(content: str, fund_code: str) -> list[dict[str, Any]]:
+    """从 HTML 内容中解析债券持仓，结构与股票类似但字段更少。"""
     holdings: list[dict[str, Any]] = []
     sections = re.split(r"(\d{4}年\d季度[^<]*)", content)
 
@@ -413,7 +475,7 @@ def parse_bond_holdings(content: str, fund_code: str) -> list[dict[str, Any]]:
                     instrument_name=bond_name.strip(),
                     rank_num=int(rank),
                     nav_ratio=nav_ratio,
-                    share_count=None,
+                    share_count=None,  # 债券无持股数
                     market_value=market_value,
                     holding_type="bond",
                 )
@@ -435,6 +497,7 @@ def _build_holding_item(
     market_value,
     holding_type: str,
 ) -> dict[str, Any]:
+    """构建单条持仓字典，统一字段名供数据库写入。"""
     return {
         "fund_code": fund_code,
         "report_date": report_date,
@@ -451,6 +514,7 @@ def _build_holding_item(
 
 
 def keep_latest_quarter(holdings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """从多条季度持仓中只保留 report_date 最新的一季。"""
     if not holdings:
         return []
 
@@ -459,6 +523,7 @@ def keep_latest_quarter(holdings: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _to_float(value):
+    """安全地将字符串转为 float，无效值返回 None。"""
     if value in (None, "", "--"):
         return None
     if not isinstance(value, str):
@@ -468,4 +533,3 @@ def _to_float(value):
         return float(value)
     except ValueError:
         return None
-

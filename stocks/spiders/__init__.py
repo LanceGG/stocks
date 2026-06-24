@@ -1,4 +1,1 @@
-# This package will contain the spiders of your Scrapy project
-#
-# Please refer to the documentation for information on how to create and manage
-# your spiders.
+"""Scrapy 爬虫包：包含 fund、fund_holding、fund_holding_current 等 Spider。"""
