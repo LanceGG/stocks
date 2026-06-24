@@ -1,0 +1,5 @@
+stocks/local_settings.py
+__pycache__/
+*.py[cod]
+.scrapy/
+httpcache/
