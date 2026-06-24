@@ -122,11 +122,12 @@ class FundBatchWriter:
 
     def _flush_fund(self, fund_code: str) -> None:
         rows = self._pending_holdings.pop(fund_code, [])
+        wrote_holdings = bool(rows)
         if rows:
             count = bulk_save_fund_holdings(self._mysql_settings, rows)
             self._logger.info("基金 %s 批量写入 %s 条持仓记录", fund_code, count)
         if self._on_fund_complete:
-            self._on_fund_complete(fund_code)
+            self._on_fund_complete(fund_code, wrote_holdings=wrote_holdings)
 
 
 def load_funds_with_establish_date(mysql_settings) -> list[tuple[str, date | None]]:
@@ -232,7 +233,10 @@ def save_fund_to_filter(mysql_settings, fund_code: str) -> bool:
 
 
 class FundFilterTracker:
-    """跟踪本次爬取中确认无持仓的基金，并写入 fund_filter。"""
+    """跟踪本次爬取中确认无持仓的基金，并写入 fund_filter。
+
+    仅在单只基金全部请求完成后判定是否无持仓，避免并发爬取时提前误判。
+    """
 
     def __init__(self, mysql_settings, logger):
         self._mysql_settings = mysql_settings
@@ -251,8 +255,8 @@ class FundFilterTracker:
         self._pending_checks.setdefault(fund_code, set()).add(holding_type)
 
     def record_empty_type(self, fund_code: str, holding_type: str) -> None:
+        """接口返回无历史年份，仅记录状态，不立即写入 fund_filter。"""
         self._empty_types.setdefault(fund_code, set()).add(holding_type)
-        self._try_save(fund_code)
 
     def record_types_with_years(self, fund_code: str, holding_type: str) -> None:
         self._types_with_years.add((fund_code, holding_type))
@@ -264,10 +268,19 @@ class FundFilterTracker:
         for fund_code in self._pending_checks:
             self._try_save(fund_code)
 
-    def try_save_fund(self, fund_code: str) -> None:
+    def try_save_fund(self, fund_code: str, *, wrote_holdings: bool = False) -> None:
+        if wrote_holdings:
+            return
         self._try_save(fund_code)
 
+    def _fund_has_crawled_holdings(self, fund_code: str) -> bool:
+        return any(
+            (fund_code, holding_type) in self._type_has_holdings
+            for holding_type in ("stock", "bond")
+        )
+
     def _confirmed_empty_types(self, fund_code: str) -> set[str]:
+        """仅在基金全部请求完成后调用，此时可确认有年份但未解析到持仓的类型。"""
         empty = set(self._empty_types.get(fund_code, set()))
         pending = self._pending_checks.get(fund_code, set())
         for holding_type in pending:
@@ -284,6 +297,8 @@ class FundFilterTracker:
         if fund_code in self.filtered_codes:
             return
         if self._has_existing_holdings(fund_code):
+            return
+        if self._fund_has_crawled_holdings(fund_code):
             return
 
         pending = self._pending_checks.get(fund_code, set())

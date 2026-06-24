@@ -112,9 +112,9 @@ class FundHoldingSpider(scrapy.Spider):
         if self._filter_tracker:
             self._filter_tracker.flush()
 
-    def _on_fund_crawl_complete(self, fund_code: str) -> None:
+    def _on_fund_crawl_complete(self, fund_code: str, *, wrote_holdings: bool = False) -> None:
         if self._filter_tracker:
-            self._filter_tracker.try_save_fund(fund_code)
+            self._filter_tracker.try_save_fund(fund_code, wrote_holdings=wrote_holdings)
 
     def _fund_has_historical_holdings(self, fund_code: str) -> bool:
         return fund_code in self._historical_synced_funds
@@ -172,7 +172,7 @@ class FundHoldingSpider(scrapy.Spider):
             years = payload.get("arryear") or []
             if not years:
                 self.logger.info(
-                    "无%s持仓历史: fund_code=%s",
+                    "无%s持仓历史: fund_code=%˚s",
                     "债券" if holding_type == "bond" else "股票",
                     fund_code,
                 )
