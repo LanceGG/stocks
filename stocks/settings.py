@@ -63,6 +63,17 @@ FUND_HOLDING_CONCURRENT_REQUESTS = 16  # 全局最大并发请求数
 FUND_HOLDING_CONCURRENT_REQUESTS_PER_DOMAIN = 8  # 单域名并发
 FUND_HOLDING_DOWNLOAD_DELAY = 0  # 请求间隔（秒），0=不限速
 
+# 股票资金流向爬虫（data.eastmoney.com/zjlx/list.html）
+STOCK_CAPITAL_FLOW_PAGE_SIZE = 50  # 每页条数
+STOCK_CAPITAL_FLOW_MAX_PAGES = 0  # 0=全部页，调试可设 2
+SECTOR_CONSTITUENT_MAX_SECTORS = 0  # 0=抓取全部板块成分股
+# push2 API 域名优先级（push2 主站易断连，默认走 push2delay）
+EASTMONEY_PUSH2_HOSTS = [
+    "push2delay.eastmoney.com",
+    "82.push2.eastmoney.com",
+    "push2.eastmoney.com",
+]
+
 FEED_EXPORT_ENCODING = "utf-8"
 
 # 本地覆盖配置（含 MYSQL_PASSWORD 等敏感信息，不提交 git）

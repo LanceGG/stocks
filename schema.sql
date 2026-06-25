@@ -85,3 +85,64 @@ CREATE TABLE IF NOT EXISTS fund_holding (
     KEY idx_fund_code (fund_code),
     KEY idx_stock_code (stock_code)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='基金持仓明细';
+
+-- ========== 股票资金流向与板块（data.eastmoney.com/zjlx/list.html） ==========
+
+-- 股票基本信息
+CREATE TABLE IF NOT EXISTS stock (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+    stock_code VARCHAR(10) NOT NULL COMMENT '股票代码',
+    stock_name VARCHAR(100) NOT NULL COMMENT '股票简称',
+    market VARCHAR(4) DEFAULT NULL COMMENT '市场: SH/SZ/BJ',
+    industry_name VARCHAR(100) DEFAULT NULL COMMENT '所属行业(F10细分类)',
+    region_board VARCHAR(50) DEFAULT NULL COMMENT '地域板块',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '首次入库时间',
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_stock_code (stock_code)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='股票基本信息';
+
+-- 板块信息（行业/概念）
+CREATE TABLE IF NOT EXISTS sector (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+    sector_code VARCHAR(16) NOT NULL COMMENT '板块代码(BKxxxx)',
+    sector_name VARCHAR(100) NOT NULL COMMENT '板块名称',
+    sector_type VARCHAR(8) NOT NULL COMMENT '板块类型: hy行业/gn概念',
+    latest_price DECIMAL(16, 2) DEFAULT NULL COMMENT '板块指数/最新价',
+    change_pct DECIMAL(10, 2) DEFAULT NULL COMMENT '涨跌幅(%)',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '首次入库时间',
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_sector (sector_code, sector_type),
+    KEY idx_sector_name (sector_name, sector_type)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='行业/概念板块信息';
+
+-- 股票与板块关联
+CREATE TABLE IF NOT EXISTS stock_sector_rel (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+    stock_code VARCHAR(10) NOT NULL COMMENT '股票代码',
+    sector_code VARCHAR(16) NOT NULL COMMENT '板块代码',
+    sector_type VARCHAR(8) NOT NULL COMMENT '板块类型: hy/gn',
+    source VARCHAR(16) NOT NULL DEFAULT 'constituent' COMMENT '来源: constituent/name_match',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '首次入库时间',
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_rel (stock_code, sector_code, sector_type),
+    KEY idx_stock_code (stock_code),
+    KEY idx_sector_code (sector_code)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='股票-板块关联';
+
+-- 股票日行情快照（按交易日，支持重复爬取更新）
+CREATE TABLE IF NOT EXISTS stock_capital_flow (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+    stock_code VARCHAR(10) NOT NULL COMMENT '股票代码',
+    trade_date DATE NOT NULL COMMENT '交易日期',
+    open_price DECIMAL(12, 2) DEFAULT NULL COMMENT '开盘价',
+    close_price DECIMAL(12, 2) DEFAULT NULL COMMENT '收盘价',
+    high_price DECIMAL(12, 2) DEFAULT NULL COMMENT '最高价',
+    low_price DECIMAL(12, 2) DEFAULT NULL COMMENT '最低价',
+    crawled_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '抓取时间',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_flow (stock_code, trade_date),
+    KEY idx_trade_date (trade_date)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='股票日行情快照';

@@ -49,3 +49,43 @@ class FundHoldingItem(scrapy.Item):
     share_count = scrapy.Field()  # 持股数(万股)
     market_value = scrapy.Field()  # 持仓市值(万元)
     holding_type = scrapy.Field()  # 持仓类型: stock/bond
+
+
+class StockItem(scrapy.Item):
+    """股票基本信息。"""
+
+    stock_code = scrapy.Field()  # 股票代码
+    stock_name = scrapy.Field()  # 股票简称
+    market = scrapy.Field()  # 市场: SH/SZ/BJ
+    industry_name = scrapy.Field()  # 所属行业(F10)
+    region_board = scrapy.Field()  # 地域板块
+
+
+class SectorItem(scrapy.Item):
+    """行业/概念板块信息。"""
+
+    sector_code = scrapy.Field()  # 板块代码 BKxxxx
+    sector_name = scrapy.Field()  # 板块名称
+    sector_type = scrapy.Field()  # hy行业 / gn概念
+    latest_price = scrapy.Field()  # 板块指数
+    change_pct = scrapy.Field()  # 涨跌幅(%)
+
+
+class StockSectorRelItem(scrapy.Item):
+    """股票与板块关联。"""
+
+    stock_code = scrapy.Field()  # 股票代码
+    sector_code = scrapy.Field()  # 板块代码
+    sector_type = scrapy.Field()  # hy / gn
+    source = scrapy.Field()  # constituent / name_match
+
+
+class StockCapitalFlowItem(scrapy.Item):
+    """股票日行情快照（按交易日）。"""
+
+    stock_code = scrapy.Field()  # 股票代码
+    trade_date = scrapy.Field()  # 交易日期
+    open_price = scrapy.Field()  # 开盘价
+    close_price = scrapy.Field()  # 收盘价/最新价
+    high_price = scrapy.Field()  # 最高价
+    low_price = scrapy.Field()  # 最低价

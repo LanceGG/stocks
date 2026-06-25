@@ -533,3 +533,60 @@ def _to_float(value):
         return float(value)
     except ValueError:
         return None
+
+
+def infer_stock_market(stock_code: str) -> str | None:
+    """根据股票代码推断市场：SH/SZ/BJ。"""
+    if not stock_code:
+        return None
+    code = stock_code.strip()
+    if code.startswith(("6", "5", "9")):
+        return "SH"
+    if code.startswith(("0", "1", "2", "3")):
+        return "SZ"
+    if code.startswith(("4", "8")):
+        return "BJ"
+    return None
+
+
+def parse_trade_date_from_ts(ts_value) -> str | None:
+    """将 push2 接口 f124 时间戳转为 YYYY-MM-DD（东八区）。"""
+    if ts_value in (None, "", "-", "--", 0, "0"):
+        return None
+    try:
+        ts = int(ts_value)
+    except (TypeError, ValueError):
+        return None
+    if ts <= 0:
+        return None
+    from datetime import datetime, timedelta, timezone
+
+    cst = timezone(timedelta(hours=8))
+    return datetime.fromtimestamp(ts, tz=cst).strftime("%Y-%m-%d")
+
+
+def split_board_names(raw_value) -> list[str]:
+    """解析逗号/顿号分隔的板块名称列表。"""
+    if raw_value in (None, "", "-", "--"):
+        return []
+    text = str(raw_value).strip()
+    if not text:
+        return []
+    parts = re.split(r"[,，、;；]", text)
+    return [part.strip() for part in parts if part.strip()]
+
+
+def load_sector_name_map(mysql_settings) -> dict[tuple[str, str], str]:
+    """从 sector 表加载 (sector_type, sector_name) -> sector_code 映射。"""
+    connection = pymysql.connect(**mysql_settings)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT sector_type, sector_name, sector_code FROM sector"
+            )
+            return {
+                (row[0], row[1]): row[2]
+                for row in cursor.fetchall()
+            }
+    finally:
+        connection.close()

@@ -4,7 +4,14 @@ import pymysql
 from itemadapter import ItemAdapter
 from pymysql.err import OperationalError
 
-from stocks.items import FundHoldingItem, FundRankingItem
+from stocks.items import (
+    FundHoldingItem,
+    FundRankingItem,
+    SectorItem,
+    StockCapitalFlowItem,
+    StockItem,
+    StockSectorRelItem,
+)
 from stocks.utils import UPSERT_HOLDING_SQL, get_mysql_settings
 
 
@@ -169,6 +176,116 @@ class FundHoldingPipeline:
         data = ItemAdapter(item).asdict()
         try:
             self.cursor.execute(self.UPSERT_HOLDING_SQL, data)
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+        return item
+
+
+class StockDataPipeline:
+    """股票/板块 Pipeline：upsert stock、sector、stock_sector_rel、stock_capital_flow。"""
+
+    UPSERT_STOCK_SQL = """
+        INSERT INTO stock (
+            stock_code, stock_name, market, industry_name, region_board
+        ) VALUES (
+            %(stock_code)s, %(stock_name)s, %(market)s, %(industry_name)s, %(region_board)s
+        )
+        ON DUPLICATE KEY UPDATE
+            stock_name = VALUES(stock_name),
+            market = VALUES(market),
+            industry_name = VALUES(industry_name),
+            region_board = VALUES(region_board),
+            updated_at = CURRENT_TIMESTAMP
+    """
+
+    UPSERT_SECTOR_SQL = """
+        INSERT INTO sector (
+            sector_code, sector_name, sector_type, latest_price, change_pct
+        ) VALUES (
+            %(sector_code)s, %(sector_name)s, %(sector_type)s, %(latest_price)s, %(change_pct)s
+        )
+        ON DUPLICATE KEY UPDATE
+            sector_name = VALUES(sector_name),
+            latest_price = VALUES(latest_price),
+            change_pct = VALUES(change_pct),
+            updated_at = CURRENT_TIMESTAMP
+    """
+
+    UPSERT_STOCK_SECTOR_REL_SQL = """
+        INSERT INTO stock_sector_rel (
+            stock_code, sector_code, sector_type, source
+        ) VALUES (
+            %(stock_code)s, %(sector_code)s, %(sector_type)s, %(source)s
+        )
+        ON DUPLICATE KEY UPDATE
+            source = VALUES(source),
+            updated_at = CURRENT_TIMESTAMP
+    """
+
+    UPSERT_STOCK_CAPITAL_FLOW_SQL = """
+        INSERT INTO stock_capital_flow (
+            stock_code, trade_date, open_price, close_price, high_price, low_price
+        ) VALUES (
+            %(stock_code)s, %(trade_date)s, %(open_price)s, %(close_price)s,
+            %(high_price)s, %(low_price)s
+        )
+        ON DUPLICATE KEY UPDATE
+            open_price = VALUES(open_price),
+            close_price = VALUES(close_price),
+            high_price = VALUES(high_price),
+            low_price = VALUES(low_price),
+            crawled_at = CURRENT_TIMESTAMP
+    """
+
+    def __init__(self, mysql_settings):
+        self.mysql_settings = mysql_settings
+        self.connection = None
+        self.cursor = None
+
+    @classmethod
+    def from_crawler(cls, crawler):
+        return cls(mysql_settings=get_mysql_settings(crawler.settings))
+
+    def open_spider(self, spider):
+        cfg = self.mysql_settings
+        try:
+            self.connection = pymysql.connect(**cfg)
+        except OperationalError as exc:
+            if exc.args and exc.args[0] == 1045:
+                raise OperationalError(
+                    exc.args[0],
+                    f"MySQL 认证失败（user={cfg['user']}）。请设置 MYSQL_PASSWORD 后重试。",
+                ) from exc
+            raise
+        self.cursor = self.connection.cursor()
+        spider.logger.info(
+            "MySQL 已连接: %s:%s/%s",
+            cfg["host"],
+            cfg["port"],
+            cfg["database"],
+        )
+
+    def close_spider(self, spider):
+        if self.cursor:
+            self.cursor.close()
+        if self.connection:
+            self.connection.close()
+
+    def process_item(self, item, spider):
+        data = ItemAdapter(item).asdict()
+        try:
+            if isinstance(item, StockItem):
+                self.cursor.execute(self.UPSERT_STOCK_SQL, data)
+            elif isinstance(item, SectorItem):
+                self.cursor.execute(self.UPSERT_SECTOR_SQL, data)
+            elif isinstance(item, StockSectorRelItem):
+                self.cursor.execute(self.UPSERT_STOCK_SECTOR_REL_SQL, data)
+            elif isinstance(item, StockCapitalFlowItem):
+                self.cursor.execute(self.UPSERT_STOCK_CAPITAL_FLOW_SQL, data)
+            else:
+                return item
             self.connection.commit()
         except Exception:
             self.connection.rollback()
