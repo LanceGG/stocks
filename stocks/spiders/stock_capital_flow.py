@@ -14,6 +14,7 @@ from stocks.items import (
 )
 from stocks.utils import (
     infer_stock_market,
+    infer_trade_status,
     load_sector_name_map,
     parse_trade_date_from_ts,
     split_board_names,
@@ -35,7 +36,7 @@ INDUSTRY_FS = "m:90+t:2"
 CONCEPT_FS = "m:90+t:3"
 
 STOCK_FIELDS = (
-    "f12,f14,f2,f15,f16,f17,f124,f100,f102,f103"
+    "f12,f14,f2,f3,f5,f6,f8,f15,f16,f17,f20,f62,f124,f100,f102,f103"
 )
 SECTOR_FIELDS = "f12,f14,f2,f3,f124"
 CONSTITUENT_FIELDS = "f12,f14"
@@ -359,13 +360,35 @@ class StockCapitalFlowSpider(scrapy.Spider):
             )
 
             if trade_date:
+                open_price = self._to_decimal(row.get("f15"))
+                close_price = self._to_decimal(row.get("f2"))
+                high_price = self._to_decimal(row.get("f16"))
+                low_price = self._to_decimal(row.get("f17"))
+                volume_raw = row.get("f5")
+                volume = int(float(volume_raw)) if volume_raw not in (None, "", "-") else None
+                quote_probe = {
+                    "open_price": open_price,
+                    "close_price": close_price,
+                    "high_price": high_price,
+                    "low_price": low_price,
+                    "volume": volume,
+                }
                 yield StockCapitalFlowItem(
                     stock_code=stock_code,
                     trade_date=trade_date,
-                    open_price=self._to_decimal(row.get("f15")),
-                    close_price=self._to_decimal(row.get("f2")),
-                    high_price=self._to_decimal(row.get("f16")),
-                    low_price=self._to_decimal(row.get("f17")),
+                    open_price=open_price,
+                    close_price=close_price,
+                    high_price=high_price,
+                    low_price=low_price,
+                    pct_change=self._to_decimal(row.get("f3")),
+                    volume=volume,
+                    amount=self._to_decimal(row.get("f6")),
+                    turnover_rate=self._to_decimal(row.get("f8")),
+                    market_cap=self._to_decimal(row.get("f20")),
+                    adj_factor=None,
+                    close_adj=None,
+                    main_net_inflow=self._to_decimal(row.get("f62")),
+                    trade_status=infer_trade_status(stock_name, quote_probe),
                 )
 
             # 行业板块名称匹配（f100）

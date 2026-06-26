@@ -54,6 +54,13 @@ scrapy crawl fund_holding_current
 scrapy crawl fund_holding_current -s FUND_HOLDING_SKIP_SYNCED=False
 ```
 
+抓取基金历史净值（写入 `fund_nav`，默认 2016 年起）：
+
+```bash
+scrapy crawl fund_nav
+scrapy crawl fund_nav -s FUND_NAV_FULL_BACKFILL=True -s FUND_NAV_SKIP_SYNCED=False  # 首次全量
+```
+
 调试：
 
 ```bash
@@ -70,3 +77,6 @@ scrapy crawl fund_holding_current -s FUND_HOLDING_CURRENT_MAX_FUNDS=1
 | `fund_ranking` | 排行快照 |
 | `fund_holding` | 持仓明细（股票/债券） |
 | `fund_filter` | 无持仓基金过滤表（`fund_holding` 写入，`fund_holding_current` 读取跳过） |
+| `fund_nav` | 基金历史日净值（算任意区间涨跌幅） |
+
+详细调度说明见 [docs/OPERATIONS.md](docs/OPERATIONS.md)。

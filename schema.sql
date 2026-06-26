@@ -65,6 +65,21 @@ CREATE TABLE `fund_ranking` (
   UNIQUE KEY `uk_fund` (`fund_code`,`nav_date`)
 ) ENGINE=InnoDB AUTO_INCREMENT=19748 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='东方财富基金排行数据';
 
+-- 基金历史净值（日频，用于计算任意区间涨跌幅）
+CREATE TABLE IF NOT EXISTS fund_nav (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+    fund_code VARCHAR(10) NOT NULL COMMENT '基金代码',
+    nav_date DATE NOT NULL COMMENT '净值日期',
+    unit_nav DECIMAL(12, 4) DEFAULT NULL COMMENT '单位净值',
+    accumulated_nav DECIMAL(12, 4) DEFAULT NULL COMMENT '累计净值',
+    daily_growth_rate DECIMAL(10, 4) DEFAULT NULL COMMENT '日增长率(%)',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '首次入库时间',
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_fund_nav (fund_code, nav_date),
+    KEY idx_nav_date (nav_date)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='基金历史净值（日频）';
+
 -- 基金持仓明细（股票持仓，含历史各季度）
 CREATE TABLE IF NOT EXISTS fund_holding (
     id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '自增主键',
@@ -141,8 +156,17 @@ CREATE TABLE IF NOT EXISTS stock_capital_flow (
     close_price DECIMAL(12, 2) DEFAULT NULL COMMENT '收盘价',
     high_price DECIMAL(12, 2) DEFAULT NULL COMMENT '最高价',
     low_price DECIMAL(12, 2) DEFAULT NULL COMMENT '最低价',
+    pct_change DECIMAL(10, 2) DEFAULT NULL COMMENT '涨跌幅(%)',
+    volume BIGINT DEFAULT NULL COMMENT '成交量(股)',
+    amount DECIMAL(20, 2) DEFAULT NULL COMMENT '成交额(元)',
+    turnover_rate DECIMAL(10, 2) DEFAULT NULL COMMENT '换手率(%)',
+    market_cap DECIMAL(20, 2) DEFAULT NULL COMMENT '总市值(元)',
+    adj_factor DECIMAL(12, 6) DEFAULT NULL COMMENT '后复权因子',
+    close_adj DECIMAL(12, 2) DEFAULT NULL COMMENT '后复权收盘价',
+    main_net_inflow DECIMAL(20, 2) DEFAULT NULL COMMENT '主力净流入(元)',
+    trade_status TINYINT NOT NULL DEFAULT 0 COMMENT '0正常 1停牌 2ST',
     crawled_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '抓取时间',
     PRIMARY KEY (id),
     UNIQUE KEY uk_flow (stock_code, trade_date),
     KEY idx_trade_date (trade_date)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='股票日行情快照';
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='股票日行情（默认 2016 年起每个交易日）';

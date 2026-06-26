@@ -590,3 +590,498 @@ def load_sector_name_map(mysql_settings) -> dict[tuple[str, str], str]:
             }
     finally:
         connection.close()
+
+
+def build_stock_secid(stock_code: str, market: str | None = None) -> str:
+    """构建 push2his 接口 secid（如 1.600519、0.000001）。"""
+    market = market or infer_stock_market(stock_code)
+    prefix = {"SH": "1", "SZ": "0", "BJ": "0"}.get(market or "", "0")
+    return f"{prefix}.{stock_code}"
+
+
+def compute_quarter_first_trading_days(
+    kline_lines: list[str], from_year: int
+) -> list[str]:
+    """从日 K 线中提取各季度首个交易日（按上证指数交易日历）。"""
+    dates: list[str] = []
+    seen: set[tuple[int, int]] = set()
+    for line in kline_lines:
+        date_str = line.split(",")[0]
+        year = int(date_str[:4])
+        if year < from_year:
+            continue
+        month = int(date_str[5:7])
+        quarter = (month - 1) // 3 + 1
+        key = (year, quarter)
+        if key in seen:
+            continue
+        seen.add(key)
+        dates.append(date_str)
+    return dates
+
+
+def filter_quarter_dates_through_today(
+    dates: list[str], today: date | None = None
+) -> list[str]:
+    """过滤掉尚未到来的季度锚点日。"""
+    today = today or date.today()
+    current_quarter = (today.month - 1) // 3 + 1
+    result: list[str] = []
+    for date_str in dates:
+        year = int(date_str[:4])
+        month = int(date_str[5:7])
+        quarter = (month - 1) // 3 + 1
+        if (year, quarter) > (today.year, current_quarter):
+            continue
+        result.append(date_str)
+    return result
+
+
+def load_stocks_from_db(mysql_settings) -> list[tuple[str, str | None]]:
+    """从 stock 表加载股票代码及市场。"""
+    connection = pymysql.connect(**mysql_settings)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT stock_code, market FROM stock ORDER BY stock_code"
+            )
+            return [(row[0], row[1]) for row in cursor.fetchall()]
+    finally:
+        connection.close()
+
+
+def load_synced_quote_pairs(
+    mysql_settings, trade_dates: list[str]
+) -> set[tuple[str, str]]:
+    """加载已入库的 (stock_code, trade_date) 集合。"""
+    if not trade_dates:
+        return set()
+    connection = pymysql.connect(**mysql_settings)
+    try:
+        with connection.cursor() as cursor:
+            placeholders = ",".join(["%s"] * len(trade_dates))
+            cursor.execute(
+                f"""
+                SELECT stock_code, trade_date
+                FROM stock_capital_flow
+                WHERE trade_date IN ({placeholders})
+                """,
+                trade_dates,
+            )
+            return {
+                (row[0], row[1].isoformat() if hasattr(row[1], "isoformat") else str(row[1]))
+                for row in cursor.fetchall()
+            }
+    finally:
+        connection.close()
+
+
+def load_synced_quote_pairs_since(
+    mysql_settings, since_date: str
+) -> set[tuple[str, str]]:
+    """加载 trade_date >= since_date 的已入库 (stock_code, trade_date)。"""
+    connection = pymysql.connect(**mysql_settings)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT stock_code, trade_date
+                FROM stock_capital_flow
+                WHERE trade_date >= %s
+                """,
+                (since_date,),
+            )
+            return {
+                (row[0], row[1].isoformat() if hasattr(row[1], "isoformat") else str(row[1]))
+                for row in cursor.fetchall()
+            }
+    finally:
+        connection.close()
+
+
+UPSERT_STOCK_CAPITAL_FLOW_SQL = """
+    INSERT INTO stock_capital_flow (
+        stock_code, trade_date, open_price, close_price, high_price, low_price,
+        pct_change, volume, amount, turnover_rate, market_cap,
+        adj_factor, close_adj, main_net_inflow, trade_status
+    ) VALUES (
+        %(stock_code)s, %(trade_date)s, %(open_price)s, %(close_price)s,
+        %(high_price)s, %(low_price)s, %(pct_change)s, %(volume)s, %(amount)s,
+        %(turnover_rate)s, %(market_cap)s, %(adj_factor)s, %(close_adj)s,
+        %(main_net_inflow)s, %(trade_status)s
+    )
+    ON DUPLICATE KEY UPDATE
+        open_price = VALUES(open_price),
+        close_price = VALUES(close_price),
+        high_price = VALUES(high_price),
+        low_price = VALUES(low_price),
+        pct_change = VALUES(pct_change),
+        volume = VALUES(volume),
+        amount = VALUES(amount),
+        turnover_rate = VALUES(turnover_rate),
+        market_cap = VALUES(market_cap),
+        adj_factor = VALUES(adj_factor),
+        close_adj = VALUES(close_adj),
+        main_net_inflow = VALUES(main_net_inflow),
+        trade_status = VALUES(trade_status),
+        crawled_at = CURRENT_TIMESTAMP
+"""
+
+
+def bulk_save_stock_quotes(
+    mysql_settings, rows: list[dict[str, Any]], batch_size: int = 500
+) -> int:
+    """批量 upsert 股票日行情到 stock_capital_flow。"""
+    if not rows:
+        return 0
+    connection = pymysql.connect(**mysql_settings)
+    try:
+        with connection.cursor() as cursor:
+            for offset in range(0, len(rows), batch_size):
+                cursor.executemany(
+                    UPSERT_STOCK_CAPITAL_FLOW_SQL, rows[offset : offset + batch_size]
+                )
+            connection.commit()
+            return len(rows)
+    finally:
+        connection.close()
+
+
+def approx_latest_trade_date(today: date | None = None) -> str:
+    """估算最近一个交易日（跳过周末）。"""
+    from datetime import timedelta
+
+    d = today or date.today()
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d.isoformat()
+
+
+def load_stock_latest_trade_dates(
+    mysql_settings, since_date: str
+) -> dict[str, str]:
+    """各股票在 since_date 之后已入库的最新 trade_date。"""
+    connection = pymysql.connect(**mysql_settings)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT stock_code, MAX(trade_date)
+                FROM stock_capital_flow
+                WHERE trade_date >= %s
+                GROUP BY stock_code
+                """,
+                (since_date,),
+            )
+            return {
+                row[0]: row[1].isoformat() if hasattr(row[1], "isoformat") else str(row[1])
+                for row in cursor.fetchall()
+            }
+    finally:
+        connection.close()
+
+
+def load_stock_quote_sync_bounds(
+    mysql_settings, since_date: str
+) -> dict[str, tuple[str, str]]:
+    """各股票在 since_date 之后的 (最早 trade_date, 最新 trade_date)。"""
+    connection = pymysql.connect(**mysql_settings)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT stock_code, MIN(trade_date), MAX(trade_date)
+                FROM stock_capital_flow
+                WHERE trade_date >= %s
+                GROUP BY stock_code
+                """,
+                (since_date,),
+            )
+            return {
+                row[0]: (
+                    row[1].isoformat() if hasattr(row[1], "isoformat") else str(row[1]),
+                    row[2].isoformat() if hasattr(row[2], "isoformat") else str(row[2]),
+                )
+                for row in cursor.fetchall()
+            }
+    finally:
+        connection.close()
+
+
+def parse_kline_ohlc(line: str) -> dict[str, Any] | None:
+    """解析 push2his 日 K 单条：date,open,close,high,low,..."""
+    parts = line.split(",")
+    if len(parts) < 5:
+        return None
+    return {
+        "trade_date": parts[0],
+        "open_price": _to_float(parts[1]),
+        "close_price": _to_float(parts[2]),
+        "high_price": _to_float(parts[3]),
+        "low_price": _to_float(parts[4]),
+    }
+
+
+def build_sina_symbol(stock_code: str, market: str | None = None) -> str:
+    """构建新浪行情 symbol：sh600519 / sz000001 / bj830799。"""
+    market = market or infer_stock_market(stock_code)
+    prefix = {"SH": "sh", "SZ": "sz", "BJ": "bj"}.get(market or "", "sz")
+    return f"{prefix}{stock_code}"
+
+
+def parse_sina_kline_row(row: dict[str, Any]) -> dict[str, Any] | None:
+    """解析新浪日 K 单条 JSON。"""
+    day = row.get("day")
+    if not day:
+        return None
+    volume = _to_int(row.get("volume"))
+    return {
+        "trade_date": day,
+        "open_price": _to_float(row.get("open")),
+        "close_price": _to_float(row.get("close")),
+        "high_price": _to_float(row.get("high")),
+        "low_price": _to_float(row.get("low")),
+        "volume": volume,
+    }
+
+
+def parse_tencent_hfq_rows(payload: dict[str, Any], symbol: str) -> dict[str, list[Any]]:
+    """解析腾讯后复权日 K，返回 trade_date -> [open, close, high, low, volume]。"""
+    stock_data = (payload.get("data") or {}).get(symbol) or {}
+    hfq_rows = stock_data.get("hfqday") or []
+    result: dict[str, list[Any]] = {}
+    for row in hfq_rows:
+        if not row or len(row) < 6:
+            continue
+        result[str(row[0])] = row
+    return result
+
+
+def infer_trade_status(stock_name: str | None, quote: dict[str, Any]) -> int:
+    """推断交易状态：0正常 1停牌 2ST。"""
+    if stock_name:
+        upper = stock_name.upper()
+        if "ST" in upper or stock_name.startswith("*"):
+            return 2
+    volume = quote.get("volume") or 0
+    o = quote.get("open_price")
+    h = quote.get("high_price")
+    l = quote.get("low_price")
+    c = quote.get("close_price")
+    if volume == 0 and o is not None and o == h == l == c:
+        return 1
+    return 0
+
+
+def build_enriched_stock_quotes(
+    stock_code: str,
+    day_rows: list[dict[str, Any]],
+    hfq_by_date: dict[str, list[Any]],
+    stock_name: str | None,
+    since_date: str,
+) -> list[dict[str, Any]]:
+    """合并新浪日 K 与腾讯后复权，计算涨跌幅/复权因子等。"""
+    sorted_rows = sorted(day_rows, key=lambda item: item["trade_date"])
+    prev_close: float | None = None
+    quotes: list[dict[str, Any]] = []
+
+    for row in sorted_rows:
+        trade_date = row["trade_date"]
+        if trade_date < since_date:
+            continue
+
+        close_price = row.get("close_price")
+        pct_change = None
+        if prev_close and prev_close > 0 and close_price is not None:
+            pct_change = round((close_price - prev_close) / prev_close * 100, 2)
+
+        hfq = hfq_by_date.get(trade_date)
+        close_adj = _to_float(hfq[2]) if hfq else None
+        adj_factor = None
+        if close_adj is not None and close_price and close_price > 0:
+            adj_factor = round(close_adj / close_price, 6)
+
+        quote = {
+            "stock_code": stock_code,
+            "trade_date": trade_date,
+            "open_price": row.get("open_price"),
+            "close_price": close_price,
+            "high_price": row.get("high_price"),
+            "low_price": row.get("low_price"),
+            "pct_change": pct_change,
+            "volume": row.get("volume"),
+            "amount": None,
+            "turnover_rate": None,
+            "market_cap": None,
+            "adj_factor": adj_factor,
+            "close_adj": close_adj,
+            "main_net_inflow": None,
+            "trade_status": infer_trade_status(stock_name, row),
+        }
+        quotes.append(quote)
+        if close_price is not None:
+            prev_close = close_price
+
+    return quotes
+
+
+def load_stock_names(mysql_settings) -> dict[str, str]:
+    """加载 stock_code -> stock_name，用于 ST 判定。"""
+    connection = pymysql.connect(**mysql_settings)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT stock_code, stock_name FROM stock")
+            return {row[0]: row[1] for row in cursor.fetchall()}
+    finally:
+        connection.close()
+
+
+def _to_int(value):
+    """安全地将字符串转为 int。"""
+    if value in (None, "", "--"):
+        return None
+    try:
+        return int(float(str(value).replace(",", "")))
+    except (TypeError, ValueError):
+        return None
+
+
+def compute_quarter_first_trading_days_from_rows(
+    rows: list[dict[str, Any]], from_year: int
+) -> list[str]:
+    """从新浪 K 线 JSON 列表提取各季度首个交易日。"""
+    lines = [
+        f"{row['day']},{row.get('open')},{row.get('close')},{row.get('high')},{row.get('low')}"
+        for row in rows
+        if row.get("day")
+    ]
+    return compute_quarter_first_trading_days(lines, from_year)
+
+
+UPSERT_FUND_NAV_SQL = """
+    INSERT INTO fund_nav (
+        fund_code, nav_date, unit_nav, accumulated_nav, daily_growth_rate
+    ) VALUES (
+        %(fund_code)s, %(nav_date)s, %(unit_nav)s, %(accumulated_nav)s,
+        %(daily_growth_rate)s
+    )
+    ON DUPLICATE KEY UPDATE
+        unit_nav = VALUES(unit_nav),
+        accumulated_nav = VALUES(accumulated_nav),
+        daily_growth_rate = VALUES(daily_growth_rate),
+        updated_at = CURRENT_TIMESTAMP
+"""
+
+
+def bulk_save_fund_nav(
+    mysql_settings, rows: list[dict[str, Any]], batch_size: int = 500
+) -> int:
+    """批量 upsert 基金净值到 fund_nav 表。"""
+    if not rows:
+        return 0
+    connection = pymysql.connect(**mysql_settings)
+    try:
+        with connection.cursor() as cursor:
+            for offset in range(0, len(rows), batch_size):
+                cursor.executemany(
+                    UPSERT_FUND_NAV_SQL, rows[offset : offset + batch_size]
+                )
+            connection.commit()
+            return len(rows)
+    finally:
+        connection.close()
+
+
+def parse_fund_nav_apidata(text: str) -> dict[str, Any]:
+    """解析 F10DataApi lsjz 响应：content HTML + pages/curpage。"""
+    text = text.strip()
+    content_match = re.search(r'content:"(.*)",(?:pages|curpage|record)', text, re.S)
+    if not content_match:
+        return {"content": "", "pages": 1, "curpage": 1}
+
+    content = content_match.group(1).replace("\\'", "'")
+    pages_match = re.search(r"pages:(\d+)", text)
+    curpage_match = re.search(r"curpage:(\d+)", text)
+    return {
+        "content": content,
+        "pages": int(pages_match.group(1)) if pages_match else 1,
+        "curpage": int(curpage_match.group(1)) if curpage_match else 1,
+    }
+
+
+def parse_fund_nav_rows(content: str, fund_code: str) -> list[dict[str, Any]]:
+    """从 lsjz HTML 表格解析净值记录。"""
+    rows: list[dict[str, Any]] = []
+    pattern = re.compile(
+        r"<tr><td>([\d-]+)</td>"
+        r"<td[^>]*>([^<]*)</td>"
+        r"<td[^>]*>([^<]*)</td>"
+        r"<td[^>]*>([^<]*)</td>",
+        re.S,
+    )
+    for nav_date, unit_nav, accumulated_nav, daily_growth in pattern.findall(content):
+        unit_nav = unit_nav.strip()
+        accumulated_nav = accumulated_nav.strip()
+        if not unit_nav or unit_nav == "--":
+            continue
+        rows.append(
+            {
+                "fund_code": fund_code,
+                "nav_date": nav_date,
+                "unit_nav": _to_float(unit_nav),
+                "accumulated_nav": _to_float(accumulated_nav),
+                "daily_growth_rate": _parse_pct(daily_growth),
+            }
+        )
+    return rows
+
+
+def _parse_pct(value) -> float | None:
+    if value in (None, "", "--"):
+        return None
+    text = str(value).strip().replace("%", "")
+    return _to_float(text)
+
+
+def load_fund_nav_sync_bounds(
+    mysql_settings, since_date: str
+) -> dict[str, tuple[str, str]]:
+    """各基金在 since_date 之后的 (最早 nav_date, 最新 nav_date)。"""
+    connection = pymysql.connect(**mysql_settings)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT fund_code, MIN(nav_date), MAX(nav_date)
+                FROM fund_nav
+                WHERE nav_date >= %s
+                GROUP BY fund_code
+                """,
+                (since_date,),
+            )
+            return {
+                row[0]: (
+                    row[1].isoformat() if hasattr(row[1], "isoformat") else str(row[1]),
+                    row[2].isoformat() if hasattr(row[2], "isoformat") else str(row[2]),
+                )
+                for row in cursor.fetchall()
+            }
+    finally:
+        connection.close()
+
+
+def filter_fund_nav_rows(
+    rows: list[dict[str, Any]],
+    since_date: str,
+    latest_known: str | None = None,
+) -> list[dict[str, Any]]:
+    """按起始日与已入库最新日期过滤净值记录。"""
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        nav_date = row["nav_date"]
+        if nav_date < since_date:
+            continue
+        if latest_known and nav_date <= latest_known:
+            continue
+        result.append(row)
+    return result

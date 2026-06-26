@@ -12,7 +12,7 @@ from stocks.items import (
     StockItem,
     StockSectorRelItem,
 )
-from stocks.utils import UPSERT_HOLDING_SQL, get_mysql_settings
+from stocks.utils import UPSERT_HOLDING_SQL, UPSERT_STOCK_CAPITAL_FLOW_SQL, get_mysql_settings
 
 
 class MySQLPipeline:
@@ -224,20 +224,7 @@ class StockDataPipeline:
             updated_at = CURRENT_TIMESTAMP
     """
 
-    UPSERT_STOCK_CAPITAL_FLOW_SQL = """
-        INSERT INTO stock_capital_flow (
-            stock_code, trade_date, open_price, close_price, high_price, low_price
-        ) VALUES (
-            %(stock_code)s, %(trade_date)s, %(open_price)s, %(close_price)s,
-            %(high_price)s, %(low_price)s
-        )
-        ON DUPLICATE KEY UPDATE
-            open_price = VALUES(open_price),
-            close_price = VALUES(close_price),
-            high_price = VALUES(high_price),
-            low_price = VALUES(low_price),
-            crawled_at = CURRENT_TIMESTAMP
-    """
+    UPSERT_STOCK_CAPITAL_FLOW_SQL = UPSERT_STOCK_CAPITAL_FLOW_SQL
 
     def __init__(self, mysql_settings):
         self.mysql_settings = mysql_settings
