@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS fund (
     fund_name VARCHAR(200) NOT NULL COMMENT '基金简称',
     pinyin_abbr VARCHAR(80) DEFAULT NULL COMMENT '拼音缩写',
     establish_date DATE DEFAULT NULL COMMENT '成立日期',
+    fund_category VARCHAR(64) DEFAULT NULL COMMENT '基金类型如混合型-偏股',
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '首次入库时间',
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
     PRIMARY KEY (id),
@@ -100,6 +101,125 @@ CREATE TABLE IF NOT EXISTS fund_holding (
     KEY idx_fund_code (fund_code),
     KEY idx_stock_code (stock_code)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='基金持仓明细';
+
+-- ========== 基金筛选（黑马筛选，fund_screening 爬虫 + 批处理计算） ==========
+
+-- 基金规模快照（gmbd 接口）
+CREATE TABLE IF NOT EXISTS fund_scale (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+    fund_code VARCHAR(10) NOT NULL COMMENT '基金代码',
+    report_date DATE NOT NULL COMMENT '报告日期',
+    net_asset_yi DECIMAL(16, 4) DEFAULT NULL COMMENT '净资产(亿元)',
+    total_shares_yi DECIMAL(16, 4) DEFAULT NULL COMMENT '总份额(亿份)',
+    crawled_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '抓取时间',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_scale (fund_code, report_date),
+    KEY idx_fund_code (fund_code)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='基金规模快照';
+
+-- 基金经理
+CREATE TABLE IF NOT EXISTS fund_manager (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+    manager_id VARCHAR(32) NOT NULL COMMENT '经理ID',
+    manager_name VARCHAR(64) NOT NULL COMMENT '经理姓名',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '首次入库时间',
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_manager (manager_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='基金经理';
+
+-- 基金-经理任职关系
+CREATE TABLE IF NOT EXISTS fund_manager_rel (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+    fund_code VARCHAR(10) NOT NULL COMMENT '基金代码',
+    manager_id VARCHAR(32) NOT NULL COMMENT '经理ID',
+    start_date DATE DEFAULT NULL COMMENT '任职开始日',
+    end_date DATE DEFAULT NULL COMMENT '任职结束日',
+    is_current TINYINT(1) NOT NULL DEFAULT 0 COMMENT '是否现任: 1是 0否',
+    tenure_days INT DEFAULT NULL COMMENT '任职天数',
+    crawled_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '抓取时间',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_rel (fund_code, manager_id, start_date),
+    KEY idx_fund_code (fund_code),
+    KEY idx_manager_id (manager_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='基金-经理任职关系';
+
+-- 基金运作指标（换手率，JJHSL 接口）
+CREATE TABLE IF NOT EXISTS fund_operation (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+    fund_code VARCHAR(10) NOT NULL COMMENT '基金代码',
+    report_date DATE NOT NULL COMMENT '报告日期',
+    turnover_rate DECIMAL(10, 2) DEFAULT NULL COMMENT '换手率(%)',
+    crawled_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '抓取时间',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_op (fund_code, report_date),
+    KEY idx_fund_code (fund_code)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='基金运作指标（换手率）';
+
+-- 基金风险收益指标（由 fund_nav 批处理计算）
+CREATE TABLE IF NOT EXISTS fund_metrics (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+    fund_code VARCHAR(10) NOT NULL COMMENT '基金代码',
+    calc_date DATE NOT NULL COMMENT '计算基准日',
+    period_years TINYINT NOT NULL COMMENT '统计周期(年): 1或2',
+    sharpe_ratio DECIMAL(10, 4) DEFAULT NULL COMMENT '夏普比率',
+    max_drawdown DECIMAL(10, 4) DEFAULT NULL COMMENT '最大回撤(%)',
+    mdd_peer_rank_pct DECIMAL(10, 2) DEFAULT NULL COMMENT '同类最大回撤排名百分位',
+    fund_category VARCHAR(64) DEFAULT NULL COMMENT '计算时基金类型',
+    crawled_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '计算时间',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_metrics (fund_code, calc_date, period_years),
+    KEY idx_fund_code (fund_code),
+    KEY idx_calc_date (calc_date)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='基金风险收益指标（计算）';
+
+-- 基金持仓集中度（由 fund_holding 批处理计算）
+CREATE TABLE IF NOT EXISTS fund_holding_stats (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+    fund_code VARCHAR(10) NOT NULL COMMENT '基金代码',
+    report_date DATE NOT NULL COMMENT '报告日期',
+    top10_concentration DECIMAL(10, 2) DEFAULT NULL COMMENT '前十大持仓占净值比例合计(%)',
+    holding_count INT DEFAULT NULL COMMENT '持仓标的数量',
+    crawled_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '计算时间',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_stats (fund_code, report_date),
+    KEY idx_fund_code (fund_code)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='基金持仓集中度（计算）';
+
+-- 黑马筛选视图（需各表数据齐全后查询）
+CREATE OR REPLACE VIEW v_fund_black_horse AS
+SELECT
+    f.fund_code,
+    f.fund_name,
+    f.fund_category,
+    fs.net_asset_yi,
+    fs.report_date AS scale_date,
+    fm.sharpe_ratio AS sharpe_1y,
+    fm.max_drawdown AS mdd_1y,
+    fm.mdd_peer_rank_pct AS mdd_rank_1y,
+    fhs.top10_concentration,
+    fmgr.manager_name AS current_manager,
+    fmr.tenure_days AS manager_tenure_days
+FROM fund f
+LEFT JOIN fund_scale fs ON f.fund_code = fs.fund_code
+    AND fs.report_date = (
+        SELECT MAX(report_date) FROM fund_scale s WHERE s.fund_code = f.fund_code
+    )
+LEFT JOIN fund_metrics fm ON f.fund_code = fm.fund_code
+    AND fm.period_years = 1
+    AND fm.calc_date = (
+        SELECT MAX(calc_date) FROM fund_metrics m
+        WHERE m.fund_code = f.fund_code AND m.period_years = 1
+    )
+LEFT JOIN fund_holding_stats fhs ON f.fund_code = fhs.fund_code
+    AND fhs.report_date = (
+        SELECT MAX(report_date) FROM fund_holding_stats h WHERE h.fund_code = f.fund_code
+    )
+LEFT JOIN fund_manager_rel fmr ON f.fund_code = fmr.fund_code AND fmr.is_current = 1
+LEFT JOIN fund_manager fmgr ON fmr.manager_id = fmgr.manager_id
+WHERE fs.net_asset_yi BETWEEN 2 AND 50
+    AND fm.sharpe_ratio >= 1
+    AND fm.mdd_peer_rank_pct >= 70;
 
 -- ========== 股票资金流向与板块（data.eastmoney.com/zjlx/list.html） ==========
 

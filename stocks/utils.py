@@ -1085,3 +1085,582 @@ def filter_fund_nav_rows(
             continue
         result.append(row)
     return result
+
+
+def load_fund_codes(mysql_settings) -> list[str]:
+    """从 fund 表加载全部基金代码，按代码排序。"""
+    connection = pymysql.connect(**mysql_settings)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT fund_code FROM fund ORDER BY fund_code")
+            return [row[0] for row in cursor.fetchall()]
+    finally:
+        connection.close()
+
+
+def load_synced_fund_screening_codes(mysql_settings) -> set[str]:
+    """加载本地已有筛选数据的 fund_code 集合。
+
+    判定标准：fund_category 已填，且 fund_scale、fund_manager_rel 均有记录。
+    换手率 fund_operation 部分基金无披露，不作为跳过条件。
+    """
+    connection = pymysql.connect(**mysql_settings)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT f.fund_code
+                FROM fund f
+                INNER JOIN fund_scale fs ON f.fund_code = fs.fund_code
+                INNER JOIN fund_manager_rel fmr ON f.fund_code = fmr.fund_code
+                WHERE f.fund_category IS NOT NULL
+                GROUP BY f.fund_code
+                """
+            )
+            return {row[0] for row in cursor.fetchall()}
+    finally:
+        connection.close()
+
+
+def parse_fund_gmbd_apidata(text: str) -> dict[str, Any]:
+    """解析 gmbd 接口响应：content HTML + pages（可选）。"""
+    text = text.strip()
+    match = re.search(r'var gmbd_apidata=\{ content:"(.*)",summary:', text, re.S)
+    if not match:
+        return {"content": "", "pages": 1}
+
+    content = match.group(1).replace("\\'", "'")
+    pages_match = re.search(r"pages:(\d+)", text)
+    return {
+        "content": content,
+        "pages": int(pages_match.group(1)) if pages_match else 1,
+    }
+
+
+def parse_fund_scale_rows(content: str, fund_code: str) -> list[dict[str, Any]]:
+    """从 gmbd HTML 表格解析规模记录。"""
+    rows: list[dict[str, Any]] = []
+    pattern = re.compile(
+        r"<tr><td>([\d-]+)</td>"
+        r"<td class='tor'>([^<]*)</td>"
+        r"<td class='tor'>([^<]*)</td>"
+        r"<td class='tor'>([^<]*)</td>"
+        r"<td class='tor'>([^<]*)</td>",
+        re.S,
+    )
+    for report_date, _purchase, _redeem, total_shares, net_asset in pattern.findall(
+        content
+    ):
+        rows.append(
+            {
+                "fund_code": fund_code,
+                "report_date": report_date,
+                "net_asset_yi": _to_float(net_asset),
+                "total_shares_yi": _to_float(total_shares),
+            }
+        )
+    return rows
+
+
+def parse_fund_profile(data: dict[str, Any], fund_code: str) -> dict[str, Any]:
+    """解析 FundMNDetailInformation 响应。"""
+    info = data.get("Datas") or {}
+    endnav = _to_float(info.get("ENDNAV"))
+    scale_row = None
+    report_date = info.get("FEGMRQ")
+    if report_date and report_date not in ("", "--") and endnav is not None:
+        scale_row = {
+            "fund_code": fund_code,
+            "report_date": report_date,
+            "net_asset_yi": round(endnav / 1e8, 4),
+            "total_shares_yi": None,
+        }
+    return {
+        "fund_code": fund_code,
+        "fund_category": info.get("FTYPE") or None,
+        "scale_row": scale_row,
+    }
+
+
+def parse_fund_managers(data: dict[str, Any], fund_code: str) -> tuple[list[dict], list[dict]]:
+    """解析 FundMNMangerList，拆分联合任职为单经理记录。"""
+    managers: list[dict[str, Any]] = []
+    rels: list[dict[str, Any]] = []
+    seen_managers: set[str] = set()
+
+    for item in data.get("Datas") or []:
+        mgr_ids = [part.strip() for part in str(item.get("MGRID") or "").split(",") if part.strip()]
+        mgr_names = [part.strip() for part in str(item.get("MGRNAME") or "").split(",")]
+        office_flags = [part.strip() for part in str(item.get("ISINOFFICE") or "1").split(",")]
+        start_date = _normalize_api_date(item.get("FEMPDATE"))
+        end_date = _normalize_api_date(item.get("LEMPDATE"))
+        tenure_days = _to_int(item.get("DAYS"))
+
+        for index, manager_id in enumerate(mgr_ids):
+            name = mgr_names[index] if index < len(mgr_names) else manager_id
+            is_current = (
+                office_flags[index] == "1"
+                if index < len(office_flags)
+                else end_date is None
+            )
+            if manager_id not in seen_managers:
+                managers.append({"manager_id": manager_id, "manager_name": name})
+                seen_managers.add(manager_id)
+            rels.append(
+                {
+                    "fund_code": fund_code,
+                    "manager_id": manager_id,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "is_current": 1 if is_current else 0,
+                    "tenure_days": tenure_days,
+                }
+            )
+    return managers, rels
+
+
+def parse_fund_turnover(data: dict[str, Any], fund_code: str) -> list[dict[str, Any]]:
+    """解析 JJHSL 换手率接口。"""
+    rows: list[dict[str, Any]] = []
+    for item in data.get("Data") or []:
+        report_date = item.get("REPORTDATE")
+        if not report_date:
+            continue
+        rows.append(
+            {
+                "fund_code": fund_code,
+                "report_date": report_date,
+                "turnover_rate": _to_float(item.get("STOCKTURNOVER")),
+            }
+        )
+    return rows
+
+
+def _normalize_api_date(value) -> str | None:
+    if value in (None, "", "--"):
+        return None
+    return str(value).strip()
+
+
+UPSERT_FUND_SCALE_SQL = """
+    INSERT INTO fund_scale (fund_code, report_date, net_asset_yi, total_shares_yi)
+    VALUES (%(fund_code)s, %(report_date)s, %(net_asset_yi)s, %(total_shares_yi)s)
+    ON DUPLICATE KEY UPDATE
+        net_asset_yi = VALUES(net_asset_yi),
+        total_shares_yi = VALUES(total_shares_yi),
+        crawled_at = CURRENT_TIMESTAMP
+"""
+
+
+def bulk_save_fund_scale(
+    mysql_settings, rows: list[dict[str, Any]], batch_size: int = 500
+) -> int:
+    if not rows:
+        return 0
+    connection = pymysql.connect(**mysql_settings)
+    try:
+        with connection.cursor() as cursor:
+            for offset in range(0, len(rows), batch_size):
+                cursor.executemany(
+                    UPSERT_FUND_SCALE_SQL, rows[offset : offset + batch_size]
+                )
+            connection.commit()
+            return len(rows)
+    finally:
+        connection.close()
+
+
+def update_fund_category(mysql_settings, fund_code: str, fund_category: str | None) -> None:
+    connection = pymysql.connect(**mysql_settings)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE fund SET fund_category = %s WHERE fund_code = %s",
+                (fund_category, fund_code),
+            )
+            connection.commit()
+    finally:
+        connection.close()
+
+
+UPSERT_FUND_MANAGER_SQL = """
+    INSERT INTO fund_manager (manager_id, manager_name)
+    VALUES (%(manager_id)s, %(manager_name)s)
+    ON DUPLICATE KEY UPDATE
+        manager_name = VALUES(manager_name),
+        updated_at = CURRENT_TIMESTAMP
+"""
+
+
+UPSERT_FUND_MANAGER_REL_SQL = """
+    INSERT INTO fund_manager_rel (
+        fund_code, manager_id, start_date, end_date, is_current, tenure_days
+    ) VALUES (
+        %(fund_code)s, %(manager_id)s, %(start_date)s, %(end_date)s,
+        %(is_current)s, %(tenure_days)s
+    )
+    ON DUPLICATE KEY UPDATE
+        end_date = VALUES(end_date),
+        is_current = VALUES(is_current),
+        tenure_days = VALUES(tenure_days),
+        crawled_at = CURRENT_TIMESTAMP
+"""
+
+
+def bulk_save_fund_managers(
+    mysql_settings,
+    managers: list[dict[str, Any]],
+    rels: list[dict[str, Any]],
+    batch_size: int = 500,
+) -> tuple[int, int]:
+    if not managers and not rels:
+        return 0, 0
+    connection = pymysql.connect(**mysql_settings)
+    try:
+        with connection.cursor() as cursor:
+            if managers:
+                for offset in range(0, len(managers), batch_size):
+                    cursor.executemany(
+                        UPSERT_FUND_MANAGER_SQL,
+                        managers[offset : offset + batch_size],
+                    )
+            if rels:
+                for offset in range(0, len(rels), batch_size):
+                    cursor.executemany(
+                        UPSERT_FUND_MANAGER_REL_SQL,
+                        rels[offset : offset + batch_size],
+                    )
+            connection.commit()
+            return len(managers), len(rels)
+    finally:
+        connection.close()
+
+
+UPSERT_FUND_OPERATION_SQL = """
+    INSERT INTO fund_operation (fund_code, report_date, turnover_rate)
+    VALUES (%(fund_code)s, %(report_date)s, %(turnover_rate)s)
+    ON DUPLICATE KEY UPDATE
+        turnover_rate = VALUES(turnover_rate),
+        crawled_at = CURRENT_TIMESTAMP
+"""
+
+
+def bulk_save_fund_operation(
+    mysql_settings, rows: list[dict[str, Any]], batch_size: int = 500
+) -> int:
+    if not rows:
+        return 0
+    connection = pymysql.connect(**mysql_settings)
+    try:
+        with connection.cursor() as cursor:
+            for offset in range(0, len(rows), batch_size):
+                cursor.executemany(
+                    UPSERT_FUND_OPERATION_SQL, rows[offset : offset + batch_size]
+                )
+            connection.commit()
+            return len(rows)
+    finally:
+        connection.close()
+
+
+UPSERT_FUND_METRICS_SQL = """
+    INSERT INTO fund_metrics (
+        fund_code, calc_date, period_years, sharpe_ratio, max_drawdown,
+        mdd_peer_rank_pct, fund_category
+    ) VALUES (
+        %(fund_code)s, %(calc_date)s, %(period_years)s, %(sharpe_ratio)s,
+        %(max_drawdown)s, %(mdd_peer_rank_pct)s, %(fund_category)s
+    )
+    ON DUPLICATE KEY UPDATE
+        sharpe_ratio = VALUES(sharpe_ratio),
+        max_drawdown = VALUES(max_drawdown),
+        mdd_peer_rank_pct = VALUES(mdd_peer_rank_pct),
+        fund_category = VALUES(fund_category),
+        crawled_at = CURRENT_TIMESTAMP
+"""
+
+
+UPSERT_FUND_HOLDING_STATS_SQL = """
+    INSERT INTO fund_holding_stats (
+        fund_code, report_date, top10_concentration, holding_count
+    ) VALUES (
+        %(fund_code)s, %(report_date)s, %(top10_concentration)s, %(holding_count)s
+    )
+    ON DUPLICATE KEY UPDATE
+        top10_concentration = VALUES(top10_concentration),
+        holding_count = VALUES(holding_count),
+        crawled_at = CURRENT_TIMESTAMP
+"""
+
+
+def _daily_returns(nav_values: list[float]) -> list[float]:
+    returns: list[float] = []
+    for index in range(1, len(nav_values)):
+        prev, curr = nav_values[index - 1], nav_values[index]
+        if prev and prev > 0 and curr is not None:
+            returns.append((curr - prev) / prev)
+    return returns
+
+
+def _sharpe_ratio(returns: list[float]) -> float | None:
+    import math
+
+    if len(returns) < 200:
+        return None
+    mean = sum(returns) / len(returns)
+    if len(returns) < 2:
+        return None
+    variance = sum((value - mean) ** 2 for value in returns) / (len(returns) - 1)
+    std = math.sqrt(variance)
+    if std == 0:
+        return None
+    return round((mean * 252) / (std * math.sqrt(252)), 4)
+
+
+def _max_drawdown(nav_values: list[float]) -> float | None:
+    if not nav_values:
+        return None
+    peak = nav_values[0]
+    max_dd = 0.0
+    for nav in nav_values:
+        if nav > peak:
+            peak = nav
+        if peak > 0:
+            dd = (peak - nav) / peak * 100
+            if dd > max_dd:
+                max_dd = dd
+    return round(max_dd, 4)
+
+
+def _period_nav_slice(
+    nav_rows: list[tuple[str, float]], calc_date: str, trading_days: int
+) -> list[float]:
+    filtered = [
+        unit_nav
+        for nav_date, unit_nav in nav_rows
+        if nav_date <= calc_date and unit_nav is not None
+    ]
+    if len(filtered) <= trading_days:
+        return filtered
+    return filtered[-(trading_days + 1) :]
+
+
+def compute_fund_metrics(mysql_settings, calc_date: str | None = None) -> int:
+    """从 fund_nav 计算 1y/2y 夏普、最大回撤及同类回撤排名。"""
+    from collections import defaultdict
+    from datetime import timedelta
+
+    calc_date = calc_date or date.today().isoformat()
+    start_date = (date.fromisoformat(calc_date) - timedelta(days=800)).isoformat()
+    min_days = {1: 200, 2: 400}
+    trading_days = {1: 252, 2: 504}
+
+    connection = pymysql.connect(**mysql_settings)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT fund_code, fund_category FROM fund")
+            categories = {row[0]: row[1] for row in cursor.fetchall()}
+
+            cursor.execute(
+                """
+                SELECT fund_code, nav_date, unit_nav
+                FROM fund_nav
+                WHERE nav_date >= %s AND nav_date <= %s AND unit_nav IS NOT NULL
+                ORDER BY fund_code, nav_date
+                """,
+                (start_date, calc_date),
+            )
+            nav_by_fund: dict[str, list[tuple[str, float]]] = defaultdict(list)
+            for fund_code, nav_date, unit_nav in cursor.fetchall():
+                nav_date_str = (
+                    nav_date.isoformat()
+                    if hasattr(nav_date, "isoformat")
+                    else str(nav_date)
+                )
+                nav_by_fund[fund_code].append((nav_date_str, float(unit_nav)))
+
+        raw_metrics: list[dict[str, Any]] = []
+        for fund_code, nav_rows in nav_by_fund.items():
+            category = categories.get(fund_code)
+            for period_years in (1, 2):
+                nav_slice = _period_nav_slice(
+                    nav_rows, calc_date, trading_days[period_years]
+                )
+                returns = _daily_returns(nav_slice)
+                if len(returns) < min_days[period_years]:
+                    continue
+                raw_metrics.append(
+                    {
+                        "fund_code": fund_code,
+                        "calc_date": calc_date,
+                        "period_years": period_years,
+                        "sharpe_ratio": _sharpe_ratio(returns),
+                        "max_drawdown": _max_drawdown(nav_slice),
+                        "mdd_peer_rank_pct": None,
+                        "fund_category": category,
+                    }
+                )
+
+        by_category: dict[tuple[str | None, int], list[dict[str, Any]]] = defaultdict(
+            list
+        )
+        for row in raw_metrics:
+            if row["max_drawdown"] is not None and row["fund_category"]:
+                key = (row["fund_category"], row["period_years"])
+                by_category[key].append(row)
+
+        for items in by_category.values():
+            items.sort(key=lambda item: item["max_drawdown"])
+            total = len(items)
+            for rank, item in enumerate(items, 1):
+                if total == 1:
+                    item["mdd_peer_rank_pct"] = 100.0
+                else:
+                    item["mdd_peer_rank_pct"] = round(
+                        (total - rank) / (total - 1) * 100, 2
+                    )
+
+        if not raw_metrics:
+            return 0
+
+        with connection.cursor() as cursor:
+            for offset in range(0, len(raw_metrics), 500):
+                cursor.executemany(
+                    UPSERT_FUND_METRICS_SQL, raw_metrics[offset : offset + 500]
+                )
+            connection.commit()
+            return len(raw_metrics)
+    finally:
+        connection.close()
+
+
+def compute_fund_holding_stats(mysql_settings) -> int:
+    """从 fund_holding 聚合前十大占比与持仓数量。"""
+    connection = pymysql.connect(**mysql_settings)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT fund_code, report_date,
+                       SUM(CASE WHEN rank_num <= 10 THEN IFNULL(nav_ratio, 0) ELSE 0 END),
+                       COUNT(*)
+                FROM fund_holding
+                WHERE holding_type = 'stock'
+                GROUP BY fund_code, report_date
+                """
+            )
+            rows = [
+                {
+                    "fund_code": row[0],
+                    "report_date": (
+                        row[1].isoformat()
+                        if hasattr(row[1], "isoformat")
+                        else str(row[1])
+                    ),
+                    "top10_concentration": round(float(row[2]), 2) if row[2] else None,
+                    "holding_count": int(row[3]),
+                }
+                for row in cursor.fetchall()
+            ]
+            if not rows:
+                return 0
+            for offset in range(0, len(rows), 500):
+                cursor.executemany(
+                    UPSERT_FUND_HOLDING_STATS_SQL, rows[offset : offset + 500]
+                )
+            connection.commit()
+            return len(rows)
+    finally:
+        connection.close()
+
+
+class FundScreeningBatchWriter:
+    """单只基金 4 类 API 全部完成后批量写入。"""
+
+    REQUESTS_PER_FUND = 4
+
+    def __init__(self, mysql_settings, logger):
+        self._mysql_settings = mysql_settings
+        self._logger = logger
+        self._pending_requests: dict[str, int] = {}
+        self._scale_rows: dict[str, list[dict[str, Any]]] = {}
+        self._managers: dict[str, list[dict[str, Any]]] = {}
+        self._manager_rels: dict[str, list[dict[str, Any]]] = {}
+        self._operations: dict[str, list[dict[str, Any]]] = {}
+        self._categories: dict[str, str | None] = {}
+
+    def register_fund(self, fund_code: str) -> None:
+        self._pending_requests[fund_code] = self.REQUESTS_PER_FUND
+
+    def add_profile(self, fund_code: str, profile: dict[str, Any]) -> None:
+        self._categories[fund_code] = profile.get("fund_category")
+        scale_row = profile.get("scale_row")
+        if scale_row:
+            self._scale_rows.setdefault(fund_code, []).append(scale_row)
+
+    def add_scale_rows(self, fund_code: str, rows: list[dict[str, Any]]) -> None:
+        if rows:
+            self._scale_rows.setdefault(fund_code, []).extend(rows)
+
+    def add_managers(
+        self,
+        fund_code: str,
+        managers: list[dict[str, Any]],
+        rels: list[dict[str, Any]],
+    ) -> None:
+        if managers:
+            self._managers[fund_code] = managers
+        if rels:
+            self._manager_rels[fund_code] = rels
+
+    def add_operations(self, fund_code: str, rows: list[dict[str, Any]]) -> None:
+        if rows:
+            self._operations[fund_code] = rows
+
+    def finish_request(self, fund_code: str) -> None:
+        count = self._pending_requests.get(fund_code, 0)
+        if count <= 1:
+            self._pending_requests.pop(fund_code, None)
+            self._flush_fund(fund_code)
+        else:
+            self._pending_requests[fund_code] = count - 1
+
+    def flush_all(self) -> None:
+        for fund_code in list(self._pending_requests):
+            self._flush_fund(fund_code)
+
+    def _flush_fund(self, fund_code: str) -> None:
+        category = self._categories.pop(fund_code, None)
+        if category is not None:
+            update_fund_category(self._mysql_settings, fund_code, category)
+
+        scale_rows = self._dedupe_scale(self._scale_rows.pop(fund_code, []))
+        if scale_rows:
+            count = bulk_save_fund_scale(self._mysql_settings, scale_rows)
+            self._logger.info("fund_code=%s 写入规模 %s 条", fund_code, count)
+
+        managers = self._managers.pop(fund_code, [])
+        rels = self._manager_rels.pop(fund_code, [])
+        if managers or rels:
+            mgr_count, rel_count = bulk_save_fund_managers(
+                self._mysql_settings, managers, rels
+            )
+            self._logger.info(
+                "fund_code=%s 写入经理 %s 条、任职 %s 条",
+                fund_code,
+                mgr_count,
+                rel_count,
+            )
+
+        operations = self._operations.pop(fund_code, [])
+        if operations:
+            count = bulk_save_fund_operation(self._mysql_settings, operations)
+            self._logger.info("fund_code=%s 写入换手率 %s 条", fund_code, count)
+
+    @staticmethod
+    def _dedupe_scale(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        seen: dict[tuple[str, str], dict[str, Any]] = {}
+        for row in rows:
+            key = (row["fund_code"], row["report_date"])
+            seen[key] = row
+        return list(seen.values())
