@@ -1,4 +1,4 @@
-"""股票日 K 爬虫：新浪日 K + 腾讯后复权，批量写入 stock_capital_flow。"""
+"""股票日 K 爬虫：新浪日 K + 腾讯前复权（+ 可选后复权），批量写入 stock_capital_flow。"""
 
 import json
 from datetime import date
@@ -16,7 +16,7 @@ from stocks.utils import (
     load_stock_quote_sync_bounds,
     load_stocks_from_db,
     parse_sina_kline_row,
-    parse_tencent_hfq_rows,
+    parse_tencent_fq_rows,
 )
 
 SINA_KLINE_API = (
@@ -79,7 +79,7 @@ class StockQuarterlyQuoteSpider(scrapy.Spider):
         self._since_date = "2016-01-01"
         self._mysql_settings = None
         self._latest_trade_date = ""
-        self._sync_bounds: dict[str, tuple[str, str]] = {}
+        self._sync_bounds: dict[str, tuple[str, str, str | None]] = {}
         self._stock_names: dict[str, str] = {}
 
     async def start(self):
@@ -87,7 +87,11 @@ class StockQuarterlyQuoteSpider(scrapy.Spider):
         self._mysql_settings = cfg
         self._since_date = self.settings.get("STOCK_QUOTE_START_DATE", "2016-01-01")
         self._kline_datalen = self.settings.getint("STOCK_QUOTE_KLINE_DATALEN", 4000)
-        self._hfq_bar_count = self.settings.getint("STOCK_QUOTE_HFQ_BAR_COUNT", 2000)
+        self._qfq_bar_count = self.settings.getint(
+            "STOCK_QUOTE_QFQ_BAR_COUNT",
+            self.settings.getint("STOCK_QUOTE_HFQ_BAR_COUNT", 2000),
+        )
+        self._fetch_hfq = self.settings.getbool("STOCK_QUOTE_FETCH_HFQ", True)
         self._end_date = date.today().isoformat()
         skip_synced = self.settings.getbool("STOCK_QUOTE_SKIP_SYNCED", True)
         self._latest_trade_date = approx_latest_trade_date()
@@ -120,7 +124,7 @@ class StockQuarterlyQuoteSpider(scrapy.Spider):
             )
 
         self.logger.info(
-            "抓取 %s 起日 K：待爬 %s 只，已跳过 %s 只（已同步至 %s）",
+            "抓取 %s 起日 K：待爬 %s 只，已跳过 %s 只（已同步至 %s，含前复权）",
             self._since_date,
             pending,
             skipped,
@@ -131,8 +135,10 @@ class StockQuarterlyQuoteSpider(scrapy.Spider):
         bounds = self._sync_bounds.get(stock_code)
         if not bounds:
             return False
-        earliest, latest = bounds
-        return earliest <= self._since_date and latest >= self._latest_trade_date
+        earliest, latest, qfq_latest = bounds
+        if earliest > self._since_date or latest < self._latest_trade_date:
+            return False
+        return bool(qfq_latest and qfq_latest >= self._latest_trade_date)
 
     def _build_sina_kline_request(self, symbol: str, meta: dict):
         params = {
@@ -149,13 +155,19 @@ class StockQuarterlyQuoteSpider(scrapy.Spider):
             dont_filter=True,
         )
 
-    def _build_tencent_hfq_request(self, symbol: str, meta: dict):
-        param = f"{symbol},day,{self._since_date},{self._end_date},{self._hfq_bar_count},hfq"
+    def _build_tencent_fq_request(self, symbol: str, meta: dict, fq_type: str):
+        param = (
+            f"{symbol},day,{self._since_date},{self._end_date},"
+            f"{self._qfq_bar_count},{fq_type}"
+        )
+        callback = (
+            self.parse_tencent_qfq if fq_type == "qfq" else self.parse_tencent_hfq
+        )
         return scrapy.Request(
             url=f"{TENCENT_FQKLINE_API}?param={quote(param, safe='')}",
-            callback=self.parse_tencent_hfq,
+            callback=callback,
             errback=self._request_errback,
-            meta=meta,
+            meta={**meta, "fq_type": fq_type},
             headers={"Referer": "https://finance.qq.com/"},
             dont_filter=True,
         )
@@ -188,26 +200,59 @@ class StockQuarterlyQuoteSpider(scrapy.Spider):
         if not day_rows:
             return
 
-        yield self._build_tencent_hfq_request(
+        yield self._build_tencent_fq_request(
             symbol=symbol,
             meta={**response.meta, "day_rows": day_rows},
+            fq_type="qfq",
         )
 
-    def parse_tencent_hfq(self, response):
+    def parse_tencent_qfq(self, response):
         stock_code = response.meta["stock_code"]
         symbol = response.meta["symbol"]
         day_rows = response.meta["day_rows"]
 
+        qfq_by_date: dict[str, list] = {}
+        try:
+            payload = json.loads(response.text)
+            qfq_by_date = parse_tencent_fq_rows(payload, symbol, fq_type="qfq")
+        except json.JSONDecodeError:
+            self.logger.warning("腾讯前复权解析失败: stock_code=%s", stock_code)
+
+        if self._fetch_hfq:
+            yield self._build_tencent_fq_request(
+                symbol=symbol,
+                meta={**response.meta, "day_rows": day_rows, "qfq_by_date": qfq_by_date},
+                fq_type="hfq",
+            )
+            return
+
+        self._save_quotes(stock_code, day_rows, qfq_by_date, hfq_by_date=None)
+
+    def parse_tencent_hfq(self, response):
+        stock_code = response.meta["stock_code"]
+        day_rows = response.meta["day_rows"]
+        qfq_by_date = response.meta.get("qfq_by_date") or {}
+
         hfq_by_date: dict[str, list] = {}
         try:
             payload = json.loads(response.text)
-            hfq_by_date = parse_tencent_hfq_rows(payload, symbol)
+            hfq_by_date = parse_tencent_fq_rows(payload, response.meta["symbol"], fq_type="hfq")
         except json.JSONDecodeError:
             self.logger.warning("腾讯后复权解析失败: stock_code=%s", stock_code)
 
+        self._save_quotes(stock_code, day_rows, qfq_by_date, hfq_by_date)
+
+    def _save_quotes(
+        self,
+        stock_code: str,
+        day_rows: list,
+        qfq_by_date: dict,
+        hfq_by_date: dict | None,
+    ) -> None:
         quote_rows = build_enriched_stock_quotes(
             stock_code=stock_code,
             day_rows=day_rows,
+            qfq_by_date=qfq_by_date,
             hfq_by_date=hfq_by_date,
             stock_name=self._stock_names.get(stock_code),
             since_date=self._since_date,
@@ -216,4 +261,12 @@ class StockQuarterlyQuoteSpider(scrapy.Spider):
             return
 
         count = bulk_save_stock_quotes(self._mysql_settings, quote_rows)
-        self.logger.info("stock_code=%s 批量写入 %s 条", stock_code, count)
+        qfq_count = sum(1 for row in quote_rows if row.get("close_qfq") is not None)
+        hfq_count = sum(1 for row in quote_rows if row.get("close_adj") is not None)
+        self.logger.info(
+            "stock_code=%s 批量写入 %s 条（前复权 %s 条，后复权 %s 条）",
+            stock_code,
+            count,
+            qfq_count,
+            hfq_count,
+        )

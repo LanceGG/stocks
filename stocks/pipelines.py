@@ -262,6 +262,18 @@ class StockDataPipeline:
 
     def process_item(self, item, spider):
         data = ItemAdapter(item).asdict()
+        if isinstance(item, StockCapitalFlowItem):
+            for key in (
+                "open_hfq",
+                "high_hfq",
+                "low_hfq",
+                "open_qfq",
+                "high_qfq",
+                "low_qfq",
+                "close_qfq",
+                "qfq_factor",
+            ):
+                data.setdefault(key, None)
         try:
             if isinstance(item, StockItem):
                 self.cursor.execute(self.UPSERT_STOCK_SQL, data)

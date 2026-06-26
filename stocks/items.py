@@ -96,5 +96,13 @@ class StockCapitalFlowItem(scrapy.Item):
     market_cap = scrapy.Field()  # 总市值(元)
     adj_factor = scrapy.Field()  # 后复权因子
     close_adj = scrapy.Field()  # 后复权收盘价
+    open_hfq = scrapy.Field()  # 后复权开盘价
+    high_hfq = scrapy.Field()  # 后复权最高价
+    low_hfq = scrapy.Field()  # 后复权最低价
+    open_qfq = scrapy.Field()  # 前复权开盘价
+    high_qfq = scrapy.Field()  # 前复权最高价
+    low_qfq = scrapy.Field()  # 前复权最低价
+    close_qfq = scrapy.Field()  # 前复权收盘价
+    qfq_factor = scrapy.Field()  # 前复权因子
     main_net_inflow = scrapy.Field()  # 主力净流入(元)
     trade_status = scrapy.Field()  # 0正常 1停牌 2ST

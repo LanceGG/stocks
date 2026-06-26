@@ -703,11 +703,15 @@ UPSERT_STOCK_CAPITAL_FLOW_SQL = """
     INSERT INTO stock_capital_flow (
         stock_code, trade_date, open_price, close_price, high_price, low_price,
         pct_change, volume, amount, turnover_rate, market_cap,
-        adj_factor, close_adj, main_net_inflow, trade_status
+        adj_factor, close_adj, open_hfq, high_hfq, low_hfq,
+        open_qfq, high_qfq, low_qfq, close_qfq, qfq_factor,
+        main_net_inflow, trade_status
     ) VALUES (
         %(stock_code)s, %(trade_date)s, %(open_price)s, %(close_price)s,
         %(high_price)s, %(low_price)s, %(pct_change)s, %(volume)s, %(amount)s,
         %(turnover_rate)s, %(market_cap)s, %(adj_factor)s, %(close_adj)s,
+        %(open_hfq)s, %(high_hfq)s, %(low_hfq)s,
+        %(open_qfq)s, %(high_qfq)s, %(low_qfq)s, %(close_qfq)s, %(qfq_factor)s,
         %(main_net_inflow)s, %(trade_status)s
     )
     ON DUPLICATE KEY UPDATE
@@ -722,6 +726,14 @@ UPSERT_STOCK_CAPITAL_FLOW_SQL = """
         market_cap = VALUES(market_cap),
         adj_factor = VALUES(adj_factor),
         close_adj = VALUES(close_adj),
+        open_hfq = VALUES(open_hfq),
+        high_hfq = VALUES(high_hfq),
+        low_hfq = VALUES(low_hfq),
+        open_qfq = VALUES(open_qfq),
+        high_qfq = VALUES(high_qfq),
+        low_qfq = VALUES(low_qfq),
+        close_qfq = VALUES(close_qfq),
+        qfq_factor = VALUES(qfq_factor),
         main_net_inflow = VALUES(main_net_inflow),
         trade_status = VALUES(trade_status),
         crawled_at = CURRENT_TIMESTAMP
@@ -783,14 +795,17 @@ def load_stock_latest_trade_dates(
 
 def load_stock_quote_sync_bounds(
     mysql_settings, since_date: str
-) -> dict[str, tuple[str, str]]:
-    """各股票在 since_date 之后的 (最早 trade_date, 最新 trade_date)。"""
+) -> dict[str, tuple[str, str, str | None]]:
+    """各股票在 since_date 之后的 (最早 trade_date, 最新 trade_date, 前复权最新日)。"""
     connection = pymysql.connect(**mysql_settings)
     try:
         with connection.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT stock_code, MIN(trade_date), MAX(trade_date)
+                SELECT stock_code,
+                       MIN(trade_date),
+                       MAX(trade_date),
+                       MAX(CASE WHEN close_qfq IS NOT NULL THEN trade_date END)
                 FROM stock_capital_flow
                 WHERE trade_date >= %s
                 GROUP BY stock_code
@@ -801,6 +816,11 @@ def load_stock_quote_sync_bounds(
                 row[0]: (
                     row[1].isoformat() if hasattr(row[1], "isoformat") else str(row[1]),
                     row[2].isoformat() if hasattr(row[2], "isoformat") else str(row[2]),
+                    (
+                        row[3].isoformat()
+                        if row[3] is not None and hasattr(row[3], "isoformat")
+                        else (str(row[3]) if row[3] is not None else None)
+                    ),
                 )
                 for row in cursor.fetchall()
             }
@@ -845,16 +865,33 @@ def parse_sina_kline_row(row: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
-def parse_tencent_hfq_rows(payload: dict[str, Any], symbol: str) -> dict[str, list[Any]]:
-    """解析腾讯后复权日 K，返回 trade_date -> [open, close, high, low, volume]。"""
+def parse_tencent_fq_rows(
+    payload: dict[str, Any], symbol: str, fq_type: str = "qfq"
+) -> dict[str, list[Any]]:
+    """解析腾讯前/后复权日 K。
+
+    fq_type: qfq（前复权，键 qfqday）或 hfq（后复权，键 hfqday）
+    每行: [date, open, close, high, low, volume]
+    """
+    day_key = "qfqday" if fq_type == "qfq" else "hfqday"
     stock_data = (payload.get("data") or {}).get(symbol) or {}
-    hfq_rows = stock_data.get("hfqday") or []
+    fq_rows = stock_data.get(day_key) or []
     result: dict[str, list[Any]] = {}
-    for row in hfq_rows:
+    for row in fq_rows:
         if not row or len(row) < 6:
             continue
         result[str(row[0])] = row
     return result
+
+
+def parse_tencent_hfq_rows(payload: dict[str, Any], symbol: str) -> dict[str, list[Any]]:
+    """解析腾讯后复权日 K（兼容旧调用）。"""
+    return parse_tencent_fq_rows(payload, symbol, fq_type="hfq")
+
+
+def parse_tencent_qfq_rows(payload: dict[str, Any], symbol: str) -> dict[str, list[Any]]:
+    """解析腾讯前复权日 K。"""
+    return parse_tencent_fq_rows(payload, symbol, fq_type="qfq")
 
 
 def infer_trade_status(stock_name: str | None, quote: dict[str, Any]) -> int:
@@ -876,14 +913,16 @@ def infer_trade_status(stock_name: str | None, quote: dict[str, Any]) -> int:
 def build_enriched_stock_quotes(
     stock_code: str,
     day_rows: list[dict[str, Any]],
-    hfq_by_date: dict[str, list[Any]],
+    qfq_by_date: dict[str, list[Any]],
     stock_name: str | None,
     since_date: str,
+    hfq_by_date: dict[str, list[Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    """合并新浪日 K 与腾讯后复权，计算涨跌幅/复权因子等。"""
+    """合并新浪日 K 与腾讯前复权（及可选后复权），计算涨跌幅/复权因子等。"""
     sorted_rows = sorted(day_rows, key=lambda item: item["trade_date"])
     prev_close: float | None = None
     quotes: list[dict[str, Any]] = []
+    hfq_by_date = hfq_by_date or {}
 
     for row in sorted_rows:
         trade_date = row["trade_date"]
@@ -895,8 +934,20 @@ def build_enriched_stock_quotes(
         if prev_close and prev_close > 0 and close_price is not None:
             pct_change = round((close_price - prev_close) / prev_close * 100, 2)
 
+        qfq = qfq_by_date.get(trade_date)
+        open_qfq = _to_float(qfq[1]) if qfq else None
+        close_qfq = _to_float(qfq[2]) if qfq else None
+        high_qfq = _to_float(qfq[3]) if qfq else None
+        low_qfq = _to_float(qfq[4]) if qfq else None
+        qfq_factor = None
+        if close_qfq is not None and close_price and close_price > 0:
+            qfq_factor = round(close_qfq / close_price, 6)
+
         hfq = hfq_by_date.get(trade_date)
+        open_hfq = _to_float(hfq[1]) if hfq else None
         close_adj = _to_float(hfq[2]) if hfq else None
+        high_hfq = _to_float(hfq[3]) if hfq else None
+        low_hfq = _to_float(hfq[4]) if hfq else None
         adj_factor = None
         if close_adj is not None and close_price and close_price > 0:
             adj_factor = round(close_adj / close_price, 6)
@@ -915,6 +966,14 @@ def build_enriched_stock_quotes(
             "market_cap": None,
             "adj_factor": adj_factor,
             "close_adj": close_adj,
+            "open_hfq": open_hfq,
+            "high_hfq": high_hfq,
+            "low_hfq": low_hfq,
+            "open_qfq": open_qfq,
+            "high_qfq": high_qfq,
+            "low_qfq": low_qfq,
+            "close_qfq": close_qfq,
+            "qfq_factor": qfq_factor,
             "main_net_inflow": None,
             "trade_status": infer_trade_status(stock_name, row),
         }

@@ -197,12 +197,13 @@ tail -f logs/fund_screening.log
 
 | 情况 | 行为 |
 |------|------|
-| 无 `stock_capital_flow` 数据 | 爬（新浪约 4000 根日 K + 腾讯后复权） |
+| 无 `stock_capital_flow` 数据 | 爬（新浪日 K + 腾讯前复权 qfq） |
+| 有日 K 但 **无 close_qfq**（旧数据） | 爬（补前复权） |
 | 有数据但最新 < 最近交易日 | 爬（同样拉整段 K 线） |
 | 有数据但最早 > `STOCK_QUOTE_START_DATE` | 爬（补历史缺口） |
-| 最早 ≤ 起始日 **且** 最新 ≥ 最近交易日 | **跳过** |
+| 最早 ≤ 起始日 **且** 最新 ≥ 最近交易日 **且** 前复权已齐 | **跳过** |
 
-未同步时总是拉约 4000 根 K 线；重复日期靠 `ON DUPLICATE KEY UPDATE` 覆盖，不按 `latest_known` 过滤。
+未同步时总是拉约 4000 根 K 线；重复日期靠 `ON DUPLICATE KEY UPDATE` 覆盖。
 
 ### 5.3 fund_holding — 按基金跳过
 
@@ -515,17 +516,20 @@ scrapy crawl stock_capital_flow -s SECTOR_CONSTITUENT_MAX_SECTORS=10
 
 ---
 
-### 7.7 stock_quarterly_quote — 股票日 K
+### 7.7 stock_quarterly_quote — 股票日 K（含前复权）
 
-**数据源：** 新浪日 K（`money.finance.sina.com.cn`）+ 腾讯后复权（`web.ifzq.gtimg.cn`）
+**数据源：** 新浪日 K（不复权 OHLC + volume）+ 腾讯 **前复权** qfq（`qfqday`）；可选 `STOCK_QUOTE_FETCH_HFQ=True` 额外拉后复权。
 
-**写入：** `stock_capital_flow`（OHLC、涨跌幅、后复权因子等；与 `stock_capital_flow` 爬虫共用同一张表 upsert）
+**写入：** `stock_capital_flow`（不复权 + `open_qfq/high_qfq/low_qfq/close_qfq/qfq_factor`）
 
 ```bash
-# 日常
+# 迁移（首次）
+mysql -u root -p stocks < migrations/006_stock_qfq.sql
+
+# 日常（跳过已同步且前复权已齐的股票）
 scrapy crawl stock_quarterly_quote
 
-# 首次全量 / 强制全部重爬
+# 回填前复权（已有日 K 但无 close_qfq 时会重爬）
 scrapy crawl stock_quarterly_quote -s STOCK_QUOTE_SKIP_SYNCED=False
 
 # 调试
@@ -534,26 +538,29 @@ scrapy crawl stock_quarterly_quote -s STOCK_QUOTE_MAX_STOCKS=10
 
 | 配置项 | 默认 | 说明 |
 |--------|------|------|
-| `STOCK_QUOTE_START_DATE` | 2016-01-01 | 抓取起始日 |
-| `STOCK_QUOTE_SKIP_SYNCED` | True | 已同步至最近交易日则跳过 |
-| `STOCK_QUOTE_MAX_STOCKS` | 0 | 0=不限 |
-| `STOCK_QUOTE_KLINE_DATALEN` | 4000 | 新浪单次 K 线条数 |
-| `STOCK_QUOTE_HFQ_BAR_COUNT` | 2000 | 腾讯后复权条数 |
-| `STOCK_QUOTE_BULK_BATCH_SIZE` | 500 | 批量写入条数 |
-| `STOCK_QUOTE_CONCURRENT_REQUESTS` | 32 | 全局并发 |
-| `STOCK_QUOTE_CONCURRENT_REQUESTS_PER_DOMAIN` | 16 | 单域名并发 |
+| `STOCK_QUOTE_QFQ_BAR_COUNT` | 2000 | 腾讯前复权 K 线条数 |
+| `STOCK_QUOTE_FETCH_HFQ` | False | True=额外请求后复权 adj_factor |
+| `STOCK_QUOTE_SKIP_SYNCED` | True | 要求 **close_qfq** 也同步至最近交易日才 skip |
 
-**前置：**
+**跳过条件（更新）：** 除日期范围外，还要求 `close_qfq IS NOT NULL` 且前复权最新日 ≥ 最近交易日。旧数据无 qfq 字段时会自动重爬补全。
 
-```bash
-scrapy crawl stock_capital_flow   # 先同步 stock 表
-scrapy crawl stock_quarterly_quote
-```
+**缠论日线导出示例：**
 
-启动日志示例：
-
-```
-抓取 2016-01-01 起日 K：待爬 3200 只，已跳过 2100 只（已同步至 2026-06-26）
+```sql
+SELECT
+  CONCAT(s.stock_code, '.', s.market) AS code,
+  f.trade_date AS datetime,
+  f.open_qfq  AS open,
+  f.high_qfq  AS high,
+  f.low_qfq   AS low,
+  f.close_qfq AS close,
+  f.volume,
+  f.qfq_factor AS factor
+FROM stock_capital_flow f
+JOIN stock s ON s.stock_code = f.stock_code
+WHERE f.stock_code = '600519'
+  AND f.close_qfq IS NOT NULL
+ORDER BY f.trade_date;
 ```
 
 ---
