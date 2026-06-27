@@ -715,12 +715,12 @@ UPSERT_STOCK_CAPITAL_FLOW_SQL = """
         %(main_net_inflow)s, %(trade_status)s
     )
     ON DUPLICATE KEY UPDATE
-        open_price = VALUES(open_price),
-        close_price = VALUES(close_price),
-        high_price = VALUES(high_price),
-        low_price = VALUES(low_price),
-        pct_change = VALUES(pct_change),
-        volume = VALUES(volume),
+        open_price = COALESCE(VALUES(open_price), open_price),
+        close_price = COALESCE(VALUES(close_price), close_price),
+        high_price = COALESCE(VALUES(high_price), high_price),
+        low_price = COALESCE(VALUES(low_price), low_price),
+        pct_change = COALESCE(VALUES(pct_change), pct_change),
+        volume = COALESCE(VALUES(volume), volume),
         amount = VALUES(amount),
         turnover_rate = VALUES(turnover_rate),
         market_cap = VALUES(market_cap),
@@ -729,11 +729,11 @@ UPSERT_STOCK_CAPITAL_FLOW_SQL = """
         open_hfq = VALUES(open_hfq),
         high_hfq = VALUES(high_hfq),
         low_hfq = VALUES(low_hfq),
-        open_qfq = VALUES(open_qfq),
-        high_qfq = VALUES(high_qfq),
-        low_qfq = VALUES(low_qfq),
-        close_qfq = VALUES(close_qfq),
-        qfq_factor = VALUES(qfq_factor),
+        open_qfq = COALESCE(VALUES(open_qfq), open_qfq),
+        high_qfq = COALESCE(VALUES(high_qfq), high_qfq),
+        low_qfq = COALESCE(VALUES(low_qfq), low_qfq),
+        close_qfq = COALESCE(VALUES(close_qfq), close_qfq),
+        qfq_factor = COALESCE(VALUES(qfq_factor), qfq_factor),
         main_net_inflow = VALUES(main_net_inflow),
         trade_status = VALUES(trade_status),
         crawled_at = CURRENT_TIMESTAMP
@@ -769,6 +769,15 @@ def approx_latest_trade_date(today: date | None = None) -> str:
     return d.isoformat()
 
 
+def is_quote_earliest_sufficient(earliest: str, since_date: str, slack_days: int = 7) -> bool:
+    """最早交易日是否覆盖 since_date（允许春节等休市空档）。"""
+    from datetime import datetime, timedelta
+
+    since = datetime.strptime(since_date, "%Y-%m-%d").date()
+    earliest_d = datetime.strptime(earliest, "%Y-%m-%d").date()
+    return earliest_d <= since + timedelta(days=slack_days)
+
+
 def load_stock_latest_trade_dates(
     mysql_settings, since_date: str
 ) -> dict[str, str]:
@@ -793,10 +802,30 @@ def load_stock_latest_trade_dates(
         connection.close()
 
 
+def build_qfq_date_chunks(
+    since_date: str, end_date: str, chunk_days: int = 700
+) -> list[tuple[str, str]]:
+    """将日期区间切分为多段，避免腾讯 qfq 单次约 640 根 K 线上限。"""
+    from datetime import datetime, timedelta
+
+    start = datetime.strptime(since_date, "%Y-%m-%d").date()
+    end = datetime.strptime(end_date, "%Y-%m-%d").date()
+    if start > end:
+        return []
+    chunks: list[tuple[str, str]] = []
+    cur = start
+    delta = timedelta(days=chunk_days)
+    while cur <= end:
+        chunk_end = min(cur + delta - timedelta(days=1), end)
+        chunks.append((cur.isoformat(), chunk_end.isoformat()))
+        cur = chunk_end + timedelta(days=1)
+    return chunks
+
+
 def load_stock_quote_sync_bounds(
     mysql_settings, since_date: str
-) -> dict[str, tuple[str, str, str | None]]:
-    """各股票在 since_date 之后的 (最早 trade_date, 最新 trade_date, 前复权最新日)。"""
+) -> dict[str, tuple[str, str, str | None, str | None]]:
+    """各股票在 since_date 之后的 (最早日, 最新日, 前复权最早日, 前复权最新日)。"""
     connection = pymysql.connect(**mysql_settings)
     try:
         with connection.cursor() as cursor:
@@ -805,6 +834,7 @@ def load_stock_quote_sync_bounds(
                 SELECT stock_code,
                        MIN(trade_date),
                        MAX(trade_date),
+                       MIN(CASE WHEN close_qfq IS NOT NULL THEN trade_date END),
                        MAX(CASE WHEN close_qfq IS NOT NULL THEN trade_date END)
                 FROM stock_capital_flow
                 WHERE trade_date >= %s
@@ -821,11 +851,59 @@ def load_stock_quote_sync_bounds(
                         if row[3] is not None and hasattr(row[3], "isoformat")
                         else (str(row[3]) if row[3] is not None else None)
                     ),
+                    (
+                        row[4].isoformat()
+                        if row[4] is not None and hasattr(row[4], "isoformat")
+                        else (str(row[4]) if row[4] is not None else None)
+                    ),
                 )
                 for row in cursor.fetchall()
             }
     finally:
         connection.close()
+
+
+def parse_eastmoney_qfq_rows(payload: dict[str, Any]) -> dict[str, list[Any]]:
+    """解析东方财富 push2his 前复权日 K（fqt=1）。
+
+    每行: date,open,close,high,low,volume,...
+    返回与腾讯兼容的 {date: [date,o,c,h,l,vol]}。
+    """
+    klines = (payload.get("data") or {}).get("klines") or []
+    result: dict[str, list[Any]] = {}
+    for line in klines:
+        parts = line.split(",")
+        if len(parts) < 6:
+            continue
+        trade_date = parts[0]
+        result[trade_date] = [
+            trade_date,
+            parts[1],
+            parts[2],
+            parts[3],
+            parts[4],
+            parts[5],
+        ]
+    return result
+
+
+def build_eastmoney_kline_url(
+    stock_code: str,
+    market: str | None,
+    since_date: str,
+    end_date: str,
+    fqt: int = 1,
+) -> str:
+    """构建东方财富 push2his 日 K URL。fqt: 0不复权 1前复权 2后复权。"""
+    secid = build_stock_secid(stock_code, market)
+    beg = since_date.replace("-", "")
+    end = end_date.replace("-", "")
+    return (
+        "https://push2his.eastmoney.com/api/qt/stock/kline/get?"
+        f"secid={secid}&fields1=f1,f2,f3,f4,f5,f6"
+        f"&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61"
+        f"&klt=101&fqt={fqt}&beg={beg}&end={end}&lmt=1000000"
+    )
 
 
 def parse_kline_ohlc(line: str) -> dict[str, Any] | None:
@@ -982,6 +1060,126 @@ def build_enriched_stock_quotes(
             prev_close = close_price
 
     return quotes
+
+
+def build_quotes_sina_only(
+    stock_code: str,
+    day_rows: list[dict[str, Any]],
+    stock_name: str | None,
+    since_date: str,
+) -> list[dict[str, Any]]:
+    """仅新浪不复权日 K（不含前复权）。"""
+    return build_enriched_stock_quotes(
+        stock_code=stock_code,
+        day_rows=day_rows,
+        qfq_by_date={},
+        hfq_by_date=None,
+        stock_name=stock_name,
+        since_date=since_date,
+    )
+
+
+def build_quotes_qfq_only(
+    stock_code: str,
+    qfq_by_date: dict[str, list[Any]],
+    stock_name: str | None,
+    since_date: str,
+) -> list[dict[str, Any]]:
+    """仅腾讯前复权日 K（缠论推荐；含 volume，不含不复权 OHLC / qfq_factor）。"""
+    quotes: list[dict[str, Any]] = []
+    prev_close: float | None = None
+
+    for trade_date in sorted(qfq_by_date):
+        if trade_date < since_date:
+            continue
+        qfq = qfq_by_date[trade_date]
+        open_qfq = _to_float(qfq[1])
+        close_qfq = _to_float(qfq[2])
+        high_qfq = _to_float(qfq[3])
+        low_qfq = _to_float(qfq[4])
+        volume = _to_int(qfq[5]) if len(qfq) > 5 else None
+
+        pct_change = None
+        if prev_close and prev_close > 0 and close_qfq is not None:
+            pct_change = round((close_qfq - prev_close) / prev_close * 100, 2)
+
+        probe = {
+            "open_price": open_qfq,
+            "close_price": close_qfq,
+            "high_price": high_qfq,
+            "low_price": low_qfq,
+            "volume": volume,
+        }
+        quotes.append(
+            {
+                "stock_code": stock_code,
+                "trade_date": trade_date,
+                "open_price": None,
+                "close_price": None,
+                "high_price": None,
+                "low_price": None,
+                "pct_change": pct_change,
+                "volume": volume,
+                "amount": None,
+                "turnover_rate": None,
+                "market_cap": None,
+                "adj_factor": None,
+                "close_adj": None,
+                "open_hfq": None,
+                "high_hfq": None,
+                "low_hfq": None,
+                "open_qfq": open_qfq,
+                "high_qfq": high_qfq,
+                "low_qfq": low_qfq,
+                "close_qfq": close_qfq,
+                "qfq_factor": None,
+                "main_net_inflow": None,
+                "trade_status": infer_trade_status(stock_name, probe),
+            }
+        )
+        if close_qfq is not None:
+            prev_close = close_qfq
+
+    return quotes
+
+
+def load_unadjusted_quotes_from_db(
+    mysql_settings, stock_code: str, since_date: str
+) -> list[dict[str, Any]]:
+    """从 stock_capital_flow 读取已有不复权日 K，供仅补 qfq 时合并。"""
+    connection = pymysql.connect(**mysql_settings)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT trade_date, open_price, close_price, high_price, low_price, volume
+                FROM stock_capital_flow
+                WHERE stock_code = %s AND trade_date >= %s
+                ORDER BY trade_date
+                """,
+                (stock_code, since_date),
+            )
+            rows = []
+            for trade_date, o, c, h, l, v in cursor.fetchall():
+                if c is None:
+                    continue
+                rows.append(
+                    {
+                        "trade_date": (
+                            trade_date.isoformat()
+                            if hasattr(trade_date, "isoformat")
+                            else str(trade_date)
+                        ),
+                        "open_price": float(o) if o is not None else None,
+                        "close_price": float(c) if c is not None else None,
+                        "high_price": float(h) if h is not None else None,
+                        "low_price": float(l) if l is not None else None,
+                        "volume": int(v) if v is not None else None,
+                    }
+                )
+            return rows
+    finally:
+        connection.close()
 
 
 def load_stock_names(mysql_settings) -> dict[str, str]:

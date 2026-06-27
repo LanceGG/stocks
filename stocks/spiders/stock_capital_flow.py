@@ -1,4 +1,4 @@
-"""东方财富资金流向爬虫：股票、板块及关联关系。"""
+"""东方财富 A 股列表爬虫：默认仅写入 stock 表；可切换全量模式含板块与当日快照。"""
 
 import json
 import math
@@ -38,12 +38,13 @@ CONCEPT_FS = "m:90+t:3"
 STOCK_FIELDS = (
     "f12,f14,f2,f3,f5,f6,f8,f15,f16,f17,f20,f62,f124,f100,f102,f103"
 )
+STOCK_LIST_FIELDS = "f12,f14,f100,f102"
 SECTOR_FIELDS = "f12,f14,f2,f3,f124"
 CONSTITUENT_FIELDS = "f12,f14"
 
 
 class StockCapitalFlowSpider(scrapy.Spider):
-    """抓取股票资金流向、板块信息及股票-板块关联。"""
+    """抓取 A 股列表；LIST_ONLY 模式下仅 upsert stock 表。"""
 
     name = "stock_capital_flow"
     allowed_domains = [
@@ -82,6 +83,26 @@ class StockCapitalFlowSpider(scrapy.Spider):
         "RETRY_HTTP_CODES": [500, 502, 503, 504, 408, 429],
     }
 
+    @classmethod
+    def update_settings(cls, settings):
+        super().update_settings(settings)
+        if settings.getbool("STOCK_CAPITAL_FLOW_LIST_ONLY", True):
+            settings.set(
+                "CONCURRENT_REQUESTS",
+                settings.getint("STOCK_CAPITAL_FLOW_CONCURRENT_REQUESTS", 8),
+                priority="spider",
+            )
+            settings.set(
+                "CONCURRENT_REQUESTS_PER_DOMAIN",
+                settings.getint("STOCK_CAPITAL_FLOW_CONCURRENT_REQUESTS_PER_DOMAIN", 4),
+                priority="spider",
+            )
+            settings.set(
+                "DOWNLOAD_DELAY",
+                settings.getfloat("STOCK_CAPITAL_FLOW_DOWNLOAD_DELAY", 0.5),
+                priority="spider",
+            )
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._sector_name_map: dict[tuple[str, str], str] = {}
@@ -92,6 +113,9 @@ class StockCapitalFlowSpider(scrapy.Spider):
     def _get_api_hosts(self) -> list[str]:
         return list(self.settings.getlist("EASTMONEY_PUSH2_HOSTS") or API_HOSTS)
 
+    def _list_only(self) -> bool:
+        return self.settings.getbool("STOCK_CAPITAL_FLOW_LIST_ONLY", True)
+
     async def start(self):
         """先访问列表页获取 Cookie，再抓板块列表。"""
         yield scrapy.Request(
@@ -101,9 +125,28 @@ class StockCapitalFlowSpider(scrapy.Spider):
         )
 
     def parse_bootstrap(self, response):
-        """引导完成后串行抓取：先行业板块，再概念板块。"""
+        """引导完成后抓取 A 股列表；全量模式则先抓板块。"""
         page_size = self.settings.getint("STOCK_CAPITAL_FLOW_PAGE_SIZE", 50)
+        if self._list_only():
+            self.logger.info("LIST_ONLY：仅同步 A 股列表 → stock 表")
+            yield self._build_stock_list_request(page_index=1, page_size=page_size)
+            return
         yield self._build_sector_request("hy", INDUSTRY_FS, page_index=1, page_size=page_size)
+
+    def _build_stock_list_request(self, page_index: int, page_size: int):
+        fields = STOCK_LIST_FIELDS if self._list_only() else STOCK_FIELDS
+        return self._build_request(
+            callback=self.parse_stock,
+            fs=STOCK_FS,
+            fields=fields,
+            page_index=page_index,
+            page_size=page_size,
+            meta={
+                "page_index": page_index,
+                "fs": STOCK_FS,
+                "fields": fields,
+            },
+        )
 
     def _build_sector_request(
         self, sector_type: str, fs: str, page_index: int, page_size: int
@@ -229,18 +272,7 @@ class StockCapitalFlowSpider(scrapy.Spider):
         )
         if not self._stock_started:
             self._stock_started = True
-            yield self._build_request(
-                callback=self.parse_stock,
-                fs=STOCK_FS,
-                fields=STOCK_FIELDS,
-                page_index=1,
-                page_size=page_size,
-                meta={
-                    "page_index": 1,
-                    "fs": STOCK_FS,
-                    "fields": STOCK_FIELDS,
-                },
-            )
+            yield self._build_stock_list_request(page_index=1, page_size=page_size)
         yield from self._schedule_constituent_requests(page_size)
 
     def _schedule_constituent_requests(self, page_size: int):
@@ -320,13 +352,12 @@ class StockCapitalFlowSpider(scrapy.Spider):
             )
 
     def parse_stock(self, response):
-        """解析股票资金流向列表，并尝试按名称匹配概念板块。"""
+        """解析 A 股列表；全量模式额外写入当日快照与板块关联。"""
         page_index = response.meta["page_index"]
-        fs = response.meta["fs"]
-        fields = response.meta["fields"]
         page_size = self.settings.getint("STOCK_CAPITAL_FLOW_PAGE_SIZE", 50)
+        list_only = self._list_only()
 
-        if not self._sector_name_map:
+        if not list_only and not self._sector_name_map:
             from stocks.utils import get_mysql_settings
 
             self._sector_name_map = load_sector_name_map(
@@ -346,8 +377,6 @@ class StockCapitalFlowSpider(scrapy.Spider):
             if not stock_code or not stock_name:
                 continue
 
-            trade_date = parse_trade_date_from_ts(row.get("f124"))
-
             industry_name = self._empty_to_none(row.get("f100"))
             region_board = self._empty_to_none(row.get("f102"))
 
@@ -359,6 +388,10 @@ class StockCapitalFlowSpider(scrapy.Spider):
                 region_board=region_board,
             )
 
+            if list_only:
+                continue
+
+            trade_date = parse_trade_date_from_ts(row.get("f124"))
             if trade_date:
                 open_price = self._to_decimal(row.get("f15"))
                 close_price = self._to_decimal(row.get("f2"))
@@ -419,22 +452,18 @@ class StockCapitalFlowSpider(scrapy.Spider):
         target_pages = min(total_pages, max_pages) if max_pages > 0 else total_pages
 
         self.logger.info(
-            "股票 page %s/%s, records=%s, total=%s",
+            "股票 page %s/%s, records=%s, total=%s%s",
             page_index,
             target_pages,
             len(rows),
             total,
+            " (LIST_ONLY)" if list_only else "",
         )
 
         if page_index < target_pages:
-            next_page = page_index + 1
-            yield self._build_request(
-                callback=self.parse_stock,
-                fs=fs,
-                fields=fields,
-                page_index=next_page,
+            yield self._build_stock_list_request(
+                page_index=page_index + 1,
                 page_size=page_size,
-                meta={**response.meta, "page_index": next_page},
             )
 
     @staticmethod

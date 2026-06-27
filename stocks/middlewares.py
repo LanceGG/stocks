@@ -13,8 +13,14 @@ EASTMONEY_PUSH2_HOSTS = (
 )
 
 
+EASTMONEY_PUSH2HIS_HOSTS = (
+    "push2his.eastmoney.com",
+    "82.push2his.eastmoney.com",
+)
+
+
 class EastMoneyPush2Middleware:
-    """push2 API 连接失败时自动切换备用域名。"""
+    """push2 / push2his API 连接失败时自动切换备用域名。"""
 
     RETRY_EXCEPTIONS = (
         ConnectionLost,
@@ -28,29 +34,40 @@ class EastMoneyPush2Middleware:
         return cls(crawler.settings)
 
     def __init__(self, settings):
-        self.hosts = settings.getlist("EASTMONEY_PUSH2_HOSTS") or list(EASTMONEY_PUSH2_HOSTS)
+        self.push2_hosts = settings.getlist("EASTMONEY_PUSH2_HOSTS") or list(
+            EASTMONEY_PUSH2_HOSTS
+        )
+        self.his_hosts = settings.getlist("EASTMONEY_PUSH2HIS_HOSTS") or list(
+            EASTMONEY_PUSH2HIS_HOSTS
+        )
+
+    def _hosts_for_url(self, url: str) -> list[str] | None:
+        if any(host in url for host in self.his_hosts):
+            return self.his_hosts
+        if any(host in url for host in self.push2_hosts):
+            return self.push2_hosts
+        return None
 
     def process_exception(self, request, exception, spider):
-        if spider.name != "stock_capital_flow":
+        if spider.name not in ("stock_capital_flow", "stock_quarterly_quote"):
             return None
-        if not any(host in request.url for host in self.hosts):
+        hosts = self._hosts_for_url(request.url)
+        if not hosts:
             return None
         if not isinstance(exception, self.RETRY_EXCEPTIONS):
             return None
 
         host_idx = request.meta.get("push2_host_idx", 0) + 1
-        if host_idx >= len(self.hosts):
-            spider.logger.warning(
-                "push2 全部域名失败: %s", request.url[:120]
-            )
+        if host_idx >= len(hosts):
+            spider.logger.warning("东方财富 API 全部域名失败: %s", request.url[:120])
             return None
 
         parsed = urlparse(request.url)
-        new_url = urlunparse(parsed._replace(netloc=self.hosts[host_idx]))
+        new_url = urlunparse(parsed._replace(netloc=hosts[host_idx]))
         spider.logger.debug(
-            "push2 切换域名 %s -> %s",
+            "东方财富切换域名 %s -> %s",
             parsed.hostname,
-            self.hosts[host_idx],
+            hosts[host_idx],
         )
         return request.replace(
             url=new_url,
